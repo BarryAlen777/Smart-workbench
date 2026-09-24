@@ -5,8 +5,12 @@ license="MIT"
 modId="${mod_id}"
 version="${mod_version}"
 displayName="${mod_name}"
-authors="AutoMods"
-description='''智能工作台 Smart Workbench'''
+authors="BarryAlen777"
+credits="BarryAlen777"
+description='''智能工作台 Smart Workbench
+开源地址 Source: https://github.com/BarryAlen777/Smart-workbench'''
+logoFile="logo.png"
+displayURL="https://github.com/BarryAlen777/Smart-workbench"
 [[dependencies.${mod_id}]]
 modId="forge"
 mandatory=true
