@@ -49,11 +49,11 @@ This mod aims to completely optimize Minecraft’s cumbersome crafting process. 
 - Max bound input/output container count
 - Player backpack detection range
 
+---
 智能工作台 Smart Workbench
 一款高度自动化、可高度自定义的 Minecraft 合成辅助模组
 极简全自动合成体验，支持容器联动、链式递归合成、挂机自动产线、精妙背包全兼容、主流配方模组互通，彻底解放双手，优化原版繁琐的合成流程。
 
----
 📌 模组简介
 本模组新增智能工作台方块，支持自动扫描并联动周围存储容器，无需手动取放材料。内置可视化合成UI、多级链式合成、无人值守自动合成、输入输出容器分离绑定，同时完美兼容 JEI / REI / EMI 配方模组与精妙背包模组，是生存、大型资源量产、自动化基地必备辅助模组。
 
