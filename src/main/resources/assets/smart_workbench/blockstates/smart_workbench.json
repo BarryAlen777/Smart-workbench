@@ -1,0 +1,5 @@
+{
+  "variants": {
+    "": { "model": "smart_workbench:block/smart_workbench" }
+  }
+}

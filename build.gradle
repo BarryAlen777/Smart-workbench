@@ -1,0 +1,20 @@
+plugins { id 'java'; id 'net.minecraftforge.gradle' version '[6.0,6.2)' }
+version = '1.1.0-r35'
+group = 'cn.blockforge.generated.mod2e8abd21'
+base { archivesName = 'smart_workbench' }
+java.toolchain.languageVersion = JavaLanguageVersion.of(17)
+minecraft { mappings channel: 'official', version: '1.20.1' }
+// 对 REI / JEI / EMI 的联动完全走运行时反射（见 compat/ 下的三个 Bridge），不引入任何编译期依赖：
+// 本工程的独立编译器只认 Minecraft/Forge，而且玩家不装对应物品管理器时那套代码根本不会被执行。
+dependencies {
+    minecraft 'net.minecraftforge:forge:1.20.1-47.4.0'
+}
+tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
+processResources {
+    def props = [mod_id: 'smart_workbench', mod_name: 'Smart Workbench', mod_version: project.version,
+                 minecraft_version: '1.20.1', forge_version: '47.4.0']
+    inputs.properties props
+    filteringCharset = 'UTF-8'
+    filesMatching('META-INF/mods.toml') { expand props }
+}
+jar.finalizedBy('reobfJar')
