@@ -15,15 +15,28 @@ import java.util.function.Supplier;
 /** 服务器告诉客户端：缺少的材料可以递归合成，询问是否自动补齐。 */
 public class S2CRecursiveCraftPromptPacket {
 
+    /** 和可合成列表一样，原版 writeItem 一个字节装不下超过 127 的数量，物品按 1 个写、真实数量走 varint。 */
+    private static final int MAX_STACK_COUNT = 1_000_000;
+
     public record MissingEntry(net.minecraft.world.item.ItemStack stack, int count, boolean craftable) {
         public MissingEntry(FriendlyByteBuf buf) {
-            this(buf.readItem(), buf.readVarInt(), buf.readBoolean());
+            this(readStack(buf), buf.readVarInt(), buf.readBoolean());
         }
 
         public void write(FriendlyByteBuf buf) {
-            buf.writeItem(this.stack);
+            buf.writeItem(this.stack.copyWithCount(1));
+            buf.writeVarInt(Math.min(Math.max(1, this.stack.getCount()), MAX_STACK_COUNT));
             buf.writeVarInt(this.count);
             buf.writeBoolean(this.craftable);
+        }
+
+        private static net.minecraft.world.item.ItemStack readStack(FriendlyByteBuf buf) {
+            net.minecraft.world.item.ItemStack item = buf.readItem();
+            int count = buf.readVarInt();
+            if (!item.isEmpty()) {
+                item.setCount(Math.max(1, count));
+            }
+            return item;
         }
     }
 

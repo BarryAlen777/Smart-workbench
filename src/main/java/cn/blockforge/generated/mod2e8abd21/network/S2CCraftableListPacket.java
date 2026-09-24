@@ -21,6 +21,13 @@ import java.util.function.Supplier;
  */
 public class S2CCraftableListPacket {
 
+    /**
+     * 原版网络的 writeItem 数量字段只有一个字节（-128~127），超过 127 会被截断成负数，
+     * 客户端读回来就是一个「空堆叠」，于是明明箱子里有料，REI 还是报缺料。
+     * 所以物品本身按 1 个写、真实数量另用 varint 传；这里再设个上限防止异常数据把包撑爆。
+     */
+    private static final int MAX_SNAPSHOT_COUNT = 1_000_000;
+
     private final BlockPos pos;
     private final List<CraftableEntry> entries;
     private final List<ItemStack> storageStacks;
@@ -47,7 +54,12 @@ public class S2CCraftableListPacket {
         int storageSize = buf.readVarInt();
         List<ItemStack> storage = new ArrayList<>(storageSize);
         for (int i = 0; i < storageSize; i++) {
-            storage.add(buf.readItem());
+            ItemStack item = buf.readItem();
+            int count = buf.readVarInt();
+            if (!item.isEmpty()) {
+                item.setCount(Math.max(1, count));
+            }
+            storage.add(item);
         }
         this.storageStacks = List.copyOf(storage);
         this.storageCount = buf.readVarInt();
@@ -62,7 +74,8 @@ public class S2CCraftableListPacket {
         }
         buf.writeVarInt(this.storageStacks.size());
         for (ItemStack stack : this.storageStacks) {
-            buf.writeItem(stack);
+            buf.writeItem(stack.copyWithCount(1));
+            buf.writeVarInt(Math.min(stack.getCount(), MAX_SNAPSHOT_COUNT));
         }
         buf.writeVarInt(this.storageCount);
         buf.writeVarInt(this.outputCount);

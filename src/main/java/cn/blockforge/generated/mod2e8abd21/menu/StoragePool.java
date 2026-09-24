@@ -7,11 +7,14 @@ import net.minecraft.world.item.crafting.Ingredient;
 import net.minecraftforge.items.IItemHandler;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 把所有接入的存储拍平成一排“候选格子”，用来模拟「这点材料够不够合成一次」，
@@ -47,11 +50,15 @@ public final class StoragePool {
         List<Integer> slotList = new ArrayList<>();
         List<ItemStack> stackList = new ArrayList<>();
         Map<Item, List<Integer>> itemMap = new HashMap<>();
+        // 同一个物理格子可能被两个处理器读到：原版大箱子的两半各自查询能力时，
+        // 拿到的都是「整个合并库存」的包装器，同一格会被读两遍。这里按物品栈对象本身去重
+        // （同一个格子两次读到的是同一个 ItemStack 实例），否则材料数量会凭空翻倍。
+        Set<ItemStack> seenStacks = Collections.newSetFromMap(new IdentityHashMap<>());
         for (int h = 0; h < handlers.size(); h++) {
             IItemHandler handler = handlers.get(h);
             for (int slot = 0; slot < handler.getSlots(); slot++) {
                 ItemStack stack = handler.getStackInSlot(slot);
-                if (stack.isEmpty()) {
+                if (stack.isEmpty() || !seenStacks.add(stack)) {
                     continue;
                 }
                 handlerList.add(h);

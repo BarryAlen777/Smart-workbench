@@ -273,6 +273,7 @@ public class SmartWorkbenchBlockEntity extends BlockEntity implements Container,
      *   <li>取料容器 = 扳手绑定的（优先，不受范围限制）+ 范围内自动扫描到的；</li>
      *   <li>输出容器 = 扳手绑定的输出容器，只收产物、不参与取料；</li>
      *   <li>被绑成输出容器的坐标会从自动扫描里排除，免得刚做出来的东西又被当材料抽走；</li>
+     *   <li>指向同一份库存的重复处理器只接一次（原版大箱子的两半就是这种情况）；</li>
      *   <li>再接一层「容器里的精妙背包 + 附近玩家身上的精妙背包」，它们的内部物品也能直接取用。</li>
      * </ol>
      * 服务器端调用，带节流。
@@ -305,7 +306,7 @@ public class SmartWorkbenchBlockEntity extends BlockEntity implements Container,
         for (BlockPos bound : this.manualBindings) {
             manual.add(bound.asLong());
             IItemHandler handler = findItemHandler(this.level, bound);
-            if (handler != null && handler.getSlots() > 0) {
+            if (handler != null && handler.getSlots() > 0 && !containsInventory(inputs, handler)) {
                 inputs.add(handler);
             }
         }
@@ -332,8 +333,18 @@ public class SmartWorkbenchBlockEntity extends BlockEntity implements Container,
             }
         }
         found.sort(Comparator.comparingInt(Entry::distance));
-        for (int i = 0; i < found.size() && i < max; i++) {
-            inputs.add(found.get(i).handler);
+        int added = 0;
+        for (Entry entry : found) {
+            if (added >= max) {
+                break;
+            }
+            // 原版大箱子的两半、部分模组的双方块容器，每一半通过能力查询拿到的都是
+            // 「整个合并库存」的包装器：再接一遍会让同一格材料被数两遍，还白白占掉名额。
+            if (containsInventory(inputs, entry.handler())) {
+                continue;
+            }
+            inputs.add(entry.handler());
+            added++;
         }
 
         // 精妙背包兼容：容器里放着的背包，以及附近玩家身上/物品栏里的背包，
@@ -360,6 +371,39 @@ public class SmartWorkbenchBlockEntity extends BlockEntity implements Container,
 
     public int getConnectedStorageCount() {
         return this.storages.size();
+    }
+
+    /**
+     * 这个处理器是不是已经接进来的某一份库存的重复包装。
+     * 判定方式是槽位数相同、每个槽位返回的 ItemStack 是同一个对象，并且至少有一个非空格子；
+     * 两个全空的容器看不出区别，就不合并，宁可多接一个也不要漏掉。
+     */
+    private static boolean containsInventory(List<IItemHandler> handlers, IItemHandler candidate) {
+        for (IItemHandler existing : handlers) {
+            if (sameInventory(existing, candidate)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean sameInventory(IItemHandler first, IItemHandler second) {
+        int slots = first.getSlots();
+        if (slots != second.getSlots()) {
+            return false;
+        }
+        boolean sawItem = false;
+        for (int slot = 0; slot < slots; slot++) {
+            ItemStack a = first.getStackInSlot(slot);
+            ItemStack b = second.getStackInSlot(slot);
+            if (a != b) {
+                return false;
+            }
+            if (!a.isEmpty()) {
+                sawItem = true;
+            }
+        }
+        return sawItem;
     }
 
     /**

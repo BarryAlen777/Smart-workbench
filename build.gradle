@@ -1,5 +1,5 @@
 plugins { id 'java'; id 'net.minecraftforge.gradle' version '[6.0,6.2)' }
-version = '1.1.0-r36'
+version = '1.1.0-r38'
 group = 'cn.blockforge.generated.mod2e8abd21'
 base { archivesName = 'smart_workbench' }
 java.toolchain.languageVersion = JavaLanguageVersion.of(17)
