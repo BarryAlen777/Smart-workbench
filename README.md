@@ -4,7 +4,6 @@
 Smart Workbench
 A powerful, fully configurable automatic synthesis mod for Minecraft. Adds a new Smart Workbench block with container linking, auto-crafting, recursive crafting, full inventory/backpack support, and compatibility with mainstream inventory & recipe mods.
 
----
 ✨ Features
 1. Auto Container Connection & Visual UI
 The Smart Workbench can automatically detect and connect nearby storage containers. The built-in GUI displays all craftable items based on your stored resources. One-click to fill recipes from linked containers without manually picking up items.
@@ -35,11 +34,9 @@ Unifies chest storage + player portable backpack resources for crafting.
 Native support for JEI / REI / EMI.
 Inside the Smart Workbench GUI, you can directly open recipes from these mods and start crafting instantly. Query recipes and craft in one interface seamlessly.
 
----
 🎯 Mod Overview
 This mod aims to completely optimize Minecraft’s cumbersome crafting process. It realizes container resource integration, recursive automatic crafting, AFK production, backpack resource reading, and full compatibility with mainstream recipe mods. Perfect for survival, large-scale resource processing, and automated base production.
 
----
 ⌨️ Keybind Summary
 - Left Click — Fill recipe
 - Shift + Left Click — Quick craft
@@ -47,7 +44,6 @@ This mod aims to completely optimize Minecraft’s cumbersome crafting process. 
 - Alt + Left Click — Toggle AFK auto craft target
 - Wrench + Shift + Right Click — Switch input/output bind mode
 
----
 ⚙️ Configurable Options
 - Container scan range (3D size)
 - Max bound input/output container count
@@ -61,7 +57,6 @@ This mod aims to completely optimize Minecraft’s cumbersome crafting process. 
 📌 模组简介
 本模组新增智能工作台方块，支持自动扫描并联动周围存储容器，无需手动取放材料。内置可视化合成UI、多级链式合成、无人值守自动合成、输入输出容器分离绑定，同时完美兼容 JEI / REI / EMI 配方模组与精妙背包模组，是生存、大型资源量产、自动化基地必备辅助模组。
 
----
 ✨ 核心功能
 1. 容器自动联动 · 可视化合成UI
 智能工作台可自动侦测并连接范围内所有箱子容器，打开GUI即可预览所有可合成物品。点击物品即可自动从绑定容器提取材料填充合成网格，无需手动翻箱、取物、摆配方。
@@ -92,7 +87,6 @@ This mod aims to completely optimize Minecraft’s cumbersome crafting process. 
 原生完美兼容 JEI / REI / EMI 三大物品配方模组。
 在智能工作台界面内，直接打开任意配方，即可一键调用工作台合成能力，查配方、合成一步到位，操作丝滑无缝。
 
----
 ⌨️ 快捷键总览
 - 左键单击物品：自动填充合成材料
 - Shift + 左键：快速单次合成
@@ -100,13 +94,11 @@ This mod aims to completely optimize Minecraft’s cumbersome crafting process. 
 - Alt + 左键：设置挂机自动合成目标
 - 扳手 + Shift + 右键：切换容器输入/输出绑定模式
 
----
 ⚙️ 可配置参数
 你可在配置文件中自由调整：
 - 容器三维搜索范围
 - 输入、输出容器最大绑定数量
 - 玩家精妙背包检测范围
 
----
 🎯 模组亮点
 摒弃传统工作台繁琐的手动操作，整合容器存储 + 玩家背包 + 精妙背包全物资体系，搭配递归链式合成与无人挂机量产，同时兼容主流配方模组。轻量化、高自由、零冗余，适配单机生存、整合包制作、服务器全自动基建。
