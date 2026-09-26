@@ -3,6 +3,7 @@ package cn.blockforge.generated.mod2e8abd21.menu;
 import cn.blockforge.generated.mod2e8abd21.ModConfig;
 import cn.blockforge.generated.mod2e8abd21.ModNetwork;
 import cn.blockforge.generated.mod2e8abd21.compat.MaterialAvailability;
+import cn.blockforge.generated.mod2e8abd21.compat.PolymorphCompat;
 import cn.blockforge.generated.mod2e8abd21.ModRegistries;
 import cn.blockforge.generated.mod2e8abd21.SmartWorkbenchMod;
 import cn.blockforge.generated.mod2e8abd21.blockentity.SmartWorkbenchBlockEntity;
@@ -141,6 +142,14 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     /** 所有客户端操作共用一个服务端冷却，防止连点堆积主线程任务。 */
     private long nextActionTick;
     private CraftFeedback activeFeedback;
+    /**
+     * 玩家在本界面明确选过的配方（点列表 / REI 取料）。
+     * 同一件产物可能有好几个模组的配方都能匹配，没装多态合成时就靠它保证产物格
+     * 显示的就是玩家点的那一份，而不是原版随手取的第一份。
+     */
+    private CraftingRecipe preferredRecipe;
+    /** 上一次算产物用的配方：拿走产物时要按同一份配方算剩余物（桶、瓶子之类）。 */
+    private CraftingRecipe lastGridRecipe;
 
     /** 客户端工厂：从网络缓冲区读工作台坐标。 */
     public SmartWorkbenchMenu(int containerId, Inventory inventory, FriendlyByteBuf buf) {
@@ -449,6 +458,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         }
         placeRecipeIntoGrid(player, crafting, placeAll);
         markDirty();
+        rememberSelection(player, crafting);
         updateResult();
         this.matrixSignature = matrixSignature();
         refreshCraftables(false);
@@ -643,15 +653,14 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             return;
         }
         ItemStack result = ItemStack.EMPTY;
+        CraftingRecipe chosen = null;
         if (!this.matrix.isEmpty()) {
-            Optional<CraftingRecipe> optional =
-                    this.level.getRecipeManager().getRecipeFor(RecipeType.CRAFTING, this.matrix, this.level);
-            if (optional.isPresent()) {
-                CraftingRecipe recipe = optional.get();
+            chosen = pickGridRecipe();
+            if (chosen != null) {
                 boolean allowed = !(this.player instanceof ServerPlayer serverPlayer)
-                        || this.resultSlots.setRecipeUsed(this.level, serverPlayer, recipe);
+                        || this.resultSlots.setRecipeUsed(this.level, serverPlayer, chosen);
                 if (allowed) {
-                    ItemStack assembled = recipe.assemble(this.matrix, this.level.registryAccess());
+                    ItemStack assembled = chosen.assemble(this.matrix, this.level.registryAccess());
                     if (assembled.isItemEnabled(this.level.enabledFeatures())) {
                         result = assembled;
                     }
@@ -662,7 +671,36 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         } else {
             this.resultSlots.setRecipeUsed((Recipe<?>) null);
         }
+        this.lastGridRecipe = chosen;
         this.resultSlots.setItem(0, result);
+    }
+
+    /**
+     * 决定当前合成格该出哪一份配方。一件产物可能同时有多份配方能匹配（不同模组各加了一份），
+     * 挑选顺序是：
+     * <ol>
+     *   <li><b>装了多态合成就听它的</b>：玩家可以用产物格旁边的小按钮在几份配方间切换；</li>
+     *   <li>否则用玩家在本界面明确点过的那一份（点列表 / REI 取料时记下的）；</li>
+     *   <li>都没有才回到原版逻辑，取第一份匹配的。</li>
+     * </ol>
+     */
+    private CraftingRecipe pickGridRecipe() {
+        Optional<CraftingRecipe> polymorph =
+                PolymorphCompat.pickRecipe(this, RecipeType.CRAFTING, this.matrix, this.level, this.player);
+        if (polymorph.isPresent()) {
+            return polymorph.get();
+        }
+        if (this.preferredRecipe != null && this.preferredRecipe.matches(this.matrix, this.level)) {
+            return this.preferredRecipe;
+        }
+        return this.level.getRecipeManager()
+                .getRecipeFor(RecipeType.CRAFTING, this.matrix, this.level).orElse(null);
+    }
+
+    /** 记下玩家明确选的配方，并同步给多态合成，保证产物格显示的正是这一份。 */
+    private void rememberSelection(ServerPlayer player, CraftingRecipe recipe) {
+        this.preferredRecipe = recipe;
+        PolymorphCompat.selectRecipe(player, recipe);
     }
 
     /** 拿走一次产物：每个非空合成格减 1，桶之类的剩余物放回格子或塞给玩家。 */
@@ -671,9 +709,17 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             return;
         }
         ForgeHooks.setCraftingPlayer(player);
-        NonNullList<ItemStack> remaining = this.level.getRecipeManager()
-                .getRemainingItemsFor(RecipeType.CRAFTING, this.matrix, this.level);
-        ForgeHooks.setCraftingPlayer(null);
+        NonNullList<ItemStack> remaining;
+        try {
+            // 按「显示产物时用的同一份配方」算剩余物：同产物配方有好几份时，
+            // 原版 getRemainingItemsFor 又会去随便挑一份，可能和刚拿走的产物对不上。
+            CraftingRecipe used = this.lastGridRecipe;
+            remaining = used != null && used.matches(this.matrix, this.level)
+                    ? used.getRemainingItems(this.matrix)
+                    : this.level.getRecipeManager().getRemainingItemsFor(RecipeType.CRAFTING, this.matrix, this.level);
+        } finally {
+            ForgeHooks.setCraftingPlayer(null);
+        }
         for (int i = 0; i < remaining.size() && i < SmartWorkbenchBlockEntity.GRID_SIZE; i++) {
             ItemStack original = this.matrix.getItem(i);
             ItemStack replacement = remaining.get(i);
@@ -841,6 +887,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         }
         placeRecipeIntoGrid(player, crafting, stackAll);
         markDirty();
+        rememberSelection(player, crafting);
         updateResult();
         this.matrixSignature = matrixSignature();
         refreshCraftables(false);
@@ -1050,6 +1097,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         }
         placeRecipeIntoGrid(player, recipe, false);
         markDirty();
+        rememberSelection(player, recipe);
         updateResult();
         this.matrixSignature = matrixSignature();
         refreshCraftables(false);

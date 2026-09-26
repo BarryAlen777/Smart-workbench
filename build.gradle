@@ -1,11 +1,12 @@
 plugins { id 'java'; id 'net.minecraftforge.gradle' version '[6.0,6.2)' }
-version = '1.1.0-r38'
+version = '1.2.0-r39'
 group = 'cn.blockforge.generated.mod2e8abd21'
 base { archivesName = 'smart_workbench' }
 java.toolchain.languageVersion = JavaLanguageVersion.of(17)
 minecraft { mappings channel: 'official', version: '1.20.1' }
-// 对 REI / JEI / EMI 的联动完全走运行时反射（见 compat/ 下的三个 Bridge），不引入任何编译期依赖：
-// 本工程的独立编译器只认 Minecraft/Forge，而且玩家不装对应物品管理器时那套代码根本不会被执行。
+// 对 REI / JEI / EMI / 多态合成(Polymorph) 的联动完全走运行时反射（见 compat/ 下的各个 Bridge），
+// 不引入任何编译期依赖：本工程的独立编译器只认 Minecraft/Forge，
+// 而且玩家没装对应模组时那套代码根本不会被执行。
 dependencies {
     minecraft 'net.minecraftforge:forge:1.20.1-47.4.0'
 }

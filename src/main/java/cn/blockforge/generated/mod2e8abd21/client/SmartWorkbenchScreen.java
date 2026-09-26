@@ -4,6 +4,7 @@ import cn.blockforge.generated.mod2e8abd21.ModNetwork;
 import cn.blockforge.generated.mod2e8abd21.SmartWorkbenchMod;
 import cn.blockforge.generated.mod2e8abd21.compat.EmiTransferBridge;
 import cn.blockforge.generated.mod2e8abd21.compat.JeiTransferBridge;
+import cn.blockforge.generated.mod2e8abd21.compat.PolymorphCompat;
 import cn.blockforge.generated.mod2e8abd21.compat.ReiTransferBridge;
 import cn.blockforge.generated.mod2e8abd21.gui.GuiLayout;
 import cn.blockforge.generated.mod2e8abd21.menu.CraftableEntry;
@@ -432,6 +433,22 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
                         .append("x" + stackEntry.getValue()).withStyle(ChatFormatting.GRAY));
             }
         }
+        // 一件产物可能有好几份配方（不同模组各加一份）。把来源和份数写出来，
+        // 玩家才知道列表里两个长得一样的图标到底差在哪、该怎么选。
+        if (entry.recipeId() != null) {
+            lines.add(labelArgs("gui." + SmartWorkbenchMod.MOD_ID + ".tooltip.recipe_source",
+                            "配方来源：%s", entry.recipeId().getNamespace())
+                    .withStyle(ChatFormatting.DARK_GRAY));
+        }
+        int sameOutput = countSameOutput(entry);
+        if (sameOutput > 1) {
+            lines.add((PolymorphCompat.isLoaded()
+                    ? labelArgs("gui." + SmartWorkbenchMod.MOD_ID + ".tooltip.polymorph",
+                            "这件产物有 %s 份配方，取料后可用产物格旁的多态合成按钮切换", sameOutput)
+                    : labelArgs("gui." + SmartWorkbenchMod.MOD_ID + ".tooltip.duplicate",
+                            "这件产物有 %s 份配方，点哪一项就用哪一份", sameOutput))
+                    .withStyle(ChatFormatting.AQUA));
+        }
         lines.add(Component.empty());
         lines.add(label("gui." + SmartWorkbenchMod.MOD_ID + ".tooltip.click", "点击：自动配料到合成格")
                 .withStyle(ChatFormatting.YELLOW));
@@ -445,9 +462,25 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         return lines;
     }
 
+    /** 列表里还有几项是同一件产物。 */
+    private int countSameOutput(CraftableEntry entry) {
+        int count = 0;
+        for (CraftableEntry other : this.menu.getCraftables()) {
+            if (ItemStack.isSameItemSameTags(other.result(), entry.result())) {
+                count++;
+            }
+        }
+        return count;
+    }
+
     /** 文本组件；返回 MutableComponent 才能直接 withStyle（Component 接口上没有这个方法）。 */
     private MutableComponent label(String key, String fallback) {
         return Component.translatableWithFallback(key, fallback);
+    }
+
+    /** 带参数的文本组件。 */
+    private MutableComponent labelArgs(String key, String fallback, Object... args) {
+        return Component.translatableWithFallback(key, fallback, args);
     }
 
     /** 在按钮旁固定绘制说明，避免长文本跟随鼠标跑到列表或屏幕外。 */
