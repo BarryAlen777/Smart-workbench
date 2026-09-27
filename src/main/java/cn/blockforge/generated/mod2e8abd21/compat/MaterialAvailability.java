@@ -1,6 +1,7 @@
 package cn.blockforge.generated.mod2e8abd21.compat;
 
 import cn.blockforge.generated.mod2e8abd21.menu.SmartWorkbenchMenu;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
 
 import java.util.ArrayList;
@@ -21,6 +22,19 @@ public final class MaterialAvailability {
 
     /** 客户端可由智能工作台直接取用的材料：合成格里已有的 + 服务器推来的接入存储快照。 */
     public static List<ItemStack> collectAvailable(SmartWorkbenchMenu menu) {
+        return collectAvailable(menu, null);
+    }
+
+    /**
+     * 在上面那份材料的基础上，再把玩家自己背包（主背包 + 快捷栏）里的东西算进来。
+     * <p>
+     * 工作台现在也允许直接从玩家背包取料，REI / JEI / EMI 的「够不够」判断就必须一起算上，
+     * 否则身上明明有料，加号还是显示材料不足。传 null 表示调用方拿不到玩家上下文。
+     * <p>
+     * 这里和服务器端的 {@code PlayerMainInvWrapper} 保持一致，只数 0~35 号槽（主背包 + 快捷栏），
+     * 不含盔甲和副手；两边口径不一样会出现「界面说能做、点下去说缺料」。
+     */
+    public static List<ItemStack> collectAvailable(SmartWorkbenchMenu menu, Player player) {
         List<ItemStack> available = new ArrayList<>();
         for (ItemStack stack : menu.getMatrixItems()) {
             if (!stack.isEmpty()) {
@@ -30,6 +44,13 @@ public final class MaterialAvailability {
         for (ItemStack stack : menu.getClientStorageStacks()) {
             if (!stack.isEmpty()) {
                 available.add(stack);
+            }
+        }
+        if (player != null) {
+            for (ItemStack stack : player.getInventory().items) {
+                if (!stack.isEmpty()) {
+                    available.add(stack);
+                }
             }
         }
         return available;

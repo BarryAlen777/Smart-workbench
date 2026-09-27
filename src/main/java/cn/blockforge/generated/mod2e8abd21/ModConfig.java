@@ -25,6 +25,20 @@ public final class ModConfig {
 
     public static final ForgeConfigSpec SPEC;
 
+    /**
+     * 界面配方列表的硬上限。
+     * <p>
+     * 列表每一项都要写进网络包（配方 id + 产物堆叠），4096 项在常见整合包里大约一两百 KB，
+     * 远低于原版网络帧 2MB 的硬限制；再往大就会被服务器每 20 tick 的扫描拖慢。
+     */
+    public static final int MAX_LIST_SIZE = 4096;
+
+    /** 新配置的默认列表容量。 */
+    public static final int DEFAULT_LIST_SIZE = 1024;
+
+    /** 1.2.0 之前列表的硬上限；配置里留着这个数说明是旧版本遗留的。 */
+    private static final int LEGACY_LIST_LIMIT = 384;
+
     public static final ForgeConfigSpec.IntValue SCAN_RANGE;
     public static final ForgeConfigSpec.IntValue PLAYER_BACKPACK_RANGE;
     public static final ForgeConfigSpec.IntValue MAX_STORAGES;
@@ -58,8 +72,10 @@ public final class ModConfig {
                 .comment("扳手最多能给一台工作台绑定多少个「输出容器」（自动合成的产物会送进去）。")
                 .defineInRange("maxOutputBindings", 6, 1, 50);
         LIST_SLOTS = builder
-                .comment("一次最多在界面上列出多少个可合成配方。")
-                .defineInRange("maxListSize", 96, 12, 384);
+                .comment("一次最多在界面上列出多少个可合成配方。",
+                        "列表是边算边收的：越多人越费服务器算力、同步包也越大，所以给了个 4096 的上限。",
+                        "整合包里配方多、又觉得列表被截断，可以往大调；默认 1024。")
+                .defineInRange("maxListSize", DEFAULT_LIST_SIZE, 12, MAX_LIST_SIZE);
         STORAGE_BLACKLIST = builder
                 .comment("不接入的方块 ID 列表，例如 [\"minecraft:chest\"]。")
                 .defineListAllowEmpty("blacklist", List.of(), s -> s instanceof String);
@@ -120,7 +136,11 @@ public final class ModConfig {
     }
 
     public static int maxListSize() {
-        return Math.max(12, LIST_SLOTS.get());
+        int configured = LIST_SLOTS.get();
+        // 老配置里留下的 384 及以下的值是旧版本的硬上限，白白截断列表；
+        // 这一类遗留值统一顶到新默认值，玩家自己写的大数值照旧尊重。
+        int effective = configured <= LEGACY_LIST_LIMIT ? DEFAULT_LIST_SIZE : configured;
+        return Math.max(12, Math.min(MAX_LIST_SIZE, effective));
     }
 
     public static boolean isBlacklisted(Block block) {

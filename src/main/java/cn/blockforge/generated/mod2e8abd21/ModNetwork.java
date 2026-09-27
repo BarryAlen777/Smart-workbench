@@ -4,6 +4,7 @@ import cn.blockforge.generated.mod2e8abd21.network.C2SAutoCraftPacket;
 import cn.blockforge.generated.mod2e8abd21.network.C2SCraftRequestPacket;
 import cn.blockforge.generated.mod2e8abd21.network.C2SPlaceRecipePacket;
 import cn.blockforge.generated.mod2e8abd21.network.C2SRecursiveCraftPacket;
+import cn.blockforge.generated.mod2e8abd21.network.S2CAutoRefillPacket;
 import cn.blockforge.generated.mod2e8abd21.network.S2CCraftableListPacket;
 import cn.blockforge.generated.mod2e8abd21.network.S2CRecursiveCraftPromptPacket;
 import net.minecraft.resources.ResourceLocation;
@@ -59,6 +60,11 @@ public final class ModNetwork {
                 .encoder(C2SAutoCraftPacket::encode)
                 .decoder(C2SAutoCraftPacket::new)
                 .consumerNetworkThread(C2SAutoCraftPacket::handle)
+                .add();
+        INSTANCE.messageBuilder(S2CAutoRefillPacket.class, 6, NetworkDirection.PLAY_TO_CLIENT)
+                .encoder(S2CAutoRefillPacket::encode)
+                .decoder(S2CAutoRefillPacket::new)
+                .consumerNetworkThread(S2CAutoRefillPacket::handle)
                 .add();
     }
 

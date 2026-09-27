@@ -7,7 +7,6 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
-import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
 
 import java.lang.reflect.InvocationHandler;
@@ -39,6 +38,7 @@ public final class ReiTransferBridge {
     private static final String APPLICABILITY_NAME =
             "me.shedaniel.rei.api.client.registry.transfer.TransferHandler$ApplicabilityResult";
     private static final String REGISTRY_NAME = "me.shedaniel.rei.api.client.registry.transfer.TransferHandlerRegistry";
+    private static final String META_NAME = "me.shedaniel.rei.api.client.registry.transfer.TransferHandlerMeta";
     private static final String DISPLAY_NAME = "me.shedaniel.rei.api.common.display.Display";
     private static final String ENTRY_STACK_NAME = "me.shedaniel.rei.api.common.entry.EntryStack";
 
@@ -65,6 +65,7 @@ public final class ReiTransferBridge {
     private static Method resultBlocksFurtherHandling;
     private static Method applicabilityCreateApplicable;
     private static Method applicabilityCreateNotApplicable;
+    private static Method applicabilityCreateApplicableWithError;
 
     private ReiTransferBridge() {
     }
@@ -122,9 +123,25 @@ public final class ReiTransferBridge {
             resultBlocksFurtherHandling = resultClass.getMethod("blocksFurtherHandling", boolean.class);
             applicabilityCreateApplicable = applicabilityClass.getMethod("createApplicable");
             applicabilityCreateNotApplicable = applicabilityClass.getMethod("createNotApplicable");
+            try {
+                applicabilityCreateApplicableWithError =
+                        applicabilityClass.getMethod("createApplicableWithError", resultClass);
+            } catch (Throwable ignored) {
+                // 个别老版本没有这个重载：缺料时退回普通的「适用」，只是少了提示细节
+                applicabilityCreateApplicableWithError = null;
+            }
 
-            handlerProxy = Proxy.newProxyInstance(handlerClass.getClassLoader(),
-                    new Class<?>[]{handlerClass}, new Handler());
+            // TransferHandlerMeta 不是所有 REI 版本都有；有就一起实现，没有就只当普通处理器。
+            Class<?>[] interfaces;
+            try {
+                Class<?> metaClass = Class.forName(META_NAME);
+                metaClass.getMethod("getAvailableIngredients", contextClass);
+                interfaces = new Class<?>[]{handlerClass, metaClass};
+            } catch (Throwable ignored) {
+                interfaces = new Class<?>[]{handlerClass};
+            }
+
+            handlerProxy = Proxy.newProxyInstance(handlerClass.getClassLoader(), interfaces, new Handler());
             available = true;
         } catch (Throwable ignored) {
             // 没装 REI，或者 REI 版本对不上：静默停用，游戏照常玩
@@ -182,12 +199,56 @@ public final class ReiTransferBridge {
             return applicabilityCreateNotApplicable.invoke(null);
         }
         Object display = invokeContext(contextGetDisplay, context);
-        // 适用性阶段就排除缺料配方，让 REI 的“+”按钮变灰，而不是显示可合成后再失败。
-        if (!findMissing(display, MaterialAvailability.collectAvailable(
-                (cn.blockforge.generated.mod2e8abd21.menu.SmartWorkbenchMenu) menu)).isEmpty()) {
-            return applicabilityCreateNotApplicable.invoke(null);
+        cn.blockforge.generated.mod2e8abd21.menu.SmartWorkbenchMenu workbench =
+                (cn.blockforge.generated.mod2e8abd21.menu.SmartWorkbenchMenu) menu;
+        // 客户端还没收到存储快照（刚打开界面那一瞬）：本地根本不知道箱子里有什么，
+        // 此时的「缺料」结论不作数，先放行；真正点击时由服务端拿真实库存裁决。
+        if (!workbench.hasClientStorageSnapshot()) {
+            return applicabilityCreateApplicable.invoke(null);
+        }
+        List<Object> missing = findMissing(display,
+                MaterialAvailability.collectAvailable(workbench, Minecraft.getInstance().player));
+        if (missing.isEmpty()) {
+            return applicabilityCreateApplicable.invoke(null);
+        }
+        // 缺料时也必须咬住「这个配方归我管」，只是附一条缺料提示。
+        // 这里一旦返回 notApplicable，REI 就会接着去问原版工作台的处理器：
+        // 那个处理器只数玩家背包和菜单槽位，看不到我们接在箱子上的库存，
+        // 于是一个红色「材料不足」的加号——箱子里明明有料也没用。
+        if (applicabilityCreateApplicableWithError != null) {
+            Object failed = resultBlocksFurtherHandling.invoke(failedResult(missing), false);
+            return applicabilityCreateApplicableWithError.invoke(null, failed);
         }
         return applicabilityCreateApplicable.invoke(null);
+    }
+
+    /** 造一个「缺了哪几样」的失败结果，REI 会把它画成加号上的缺料提示。 */
+    private static Object failedResult(List<Object> missing) throws Exception {
+        Object failed = resultCreateFailed.invoke(null, Component.translatableWithFallback(
+                "gui." + SmartWorkbenchMod.MOD_ID + ".msg.transfer_missing",
+                "接入存储和背包里还缺 %s 种材料", missing.size()));
+        return resultTooltipMissing.invoke(failed, missing);
+    }
+
+    /**
+     * 告诉 REI「这名玩家手上能用的材料到底有哪些」。
+     * <p>
+     * REI 的 {@code TransferHandlerMeta} 只给「可合成过滤器」和加号旁边的快速转移提示用；
+     * 不实现它，REI 就假定只有玩家背包里的东西算数——箱子、精妙背包里的料全被无视。
+     * 合成格 + 服务器推来的存储快照 + 玩家背包，三样都要算进去，否则会反过来漏掉玩家身上的材料。
+     */
+    private static Object availableIngredients(Object context) {
+        try {
+            Object menu = invokeContext(contextGetMenu, context);
+            if (!(menu instanceof cn.blockforge.generated.mod2e8abd21.menu.SmartWorkbenchMenu workbench)) {
+                return List.of();
+            }
+            // collectAvailable 已经把「合成格 + 接入存储快照 + 玩家背包」都算进去了，
+            // 这里不要再单独加一遍玩家背包，否则同一件材料会被数两次。
+            return MaterialAvailability.collectAvailable(workbench, Minecraft.getInstance().player);
+        } catch (Throwable ignored) {
+            return List.of();
+        }
     }
 
     private static Object handle(Object context) throws Exception {
@@ -200,12 +261,10 @@ public final class ReiTransferBridge {
         if (crafting) {
             // 必须在这里拦截缺料，而不是无条件返回成功；否则 REI 会继续交给原版处理器，
             // 玩家明明缺木棍时仍然能看见可点击的“+”按钮。
-            List<Object> missing = findMissing(display, MaterialAvailability.collectAvailable(workbench));
+            List<Object> missing = findMissing(display,
+                    MaterialAvailability.collectAvailable(workbench, Minecraft.getInstance().player));
             if (!missing.isEmpty()) {
-                Object failed = resultCreateFailed.invoke(null, Component.translatableWithFallback(
-                        "gui." + SmartWorkbenchMod.MOD_ID + ".msg.transfer_missing",
-                        "接入存储里还缺材料"));
-                return resultBlocksFurtherHandling.invoke(failed, true);
+                return resultBlocksFurtherHandling.invoke(failedResult(missing), true);
             }
             Object screen = invokeContext(contextGetContainerScreen, context);
             if (screen instanceof Screen mcScreen) {
@@ -298,6 +357,9 @@ public final class ReiTransferBridge {
                     return safeCheckApplicable(args[0]);
                 case "handle":
                     return safeHandle(args[0]);
+                case "getAvailableIngredients":
+                    // TransferHandlerMeta 的方法：只在 REI 支持它时才会被调到
+                    return availableIngredients(args[0]);
                 case "equals":
                     return proxy == args[0];
                 case "hashCode":

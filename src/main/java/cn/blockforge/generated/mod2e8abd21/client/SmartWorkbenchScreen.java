@@ -183,7 +183,7 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
 
         if (list.isEmpty()) {
             drawCentredHint(graphics, label("gui." + SmartWorkbenchMod.MOD_ID + ".panel.empty",
-                    "接入存储里暂时没有能直接合成的东西"));
+                    "接入存储和背包里暂时没有能直接合成的东西"));
         }
 
         // 滚动条（贴图已画好轨道，这里只画滑块）
@@ -452,7 +452,7 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         lines.add(Component.empty());
         lines.add(label("gui." + SmartWorkbenchMod.MOD_ID + ".tooltip.click", "点击：自动配料到合成格")
                 .withStyle(ChatFormatting.YELLOW));
-        lines.add(label("gui." + SmartWorkbenchMod.MOD_ID + ".tooltip.shift", "Shift+点击：直接用存储里的材料合成")
+        lines.add(label("gui." + SmartWorkbenchMod.MOD_ID + ".tooltip.shift", "Shift+点击：直接用存储或背包里的材料合成")
                 .withStyle(ChatFormatting.YELLOW));
         lines.add(label("gui." + SmartWorkbenchMod.MOD_ID + ".tooltip.ctrl", "Ctrl+点击：批量合成，直到材料用完")
                 .withStyle(ChatFormatting.YELLOW));

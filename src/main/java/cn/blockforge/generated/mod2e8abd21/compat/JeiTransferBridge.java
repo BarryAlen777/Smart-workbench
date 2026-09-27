@@ -275,13 +275,14 @@ public final class JeiTransferBridge {
                     "gui." + SmartWorkbenchMod.MOD_ID + ".msg.unsupported",
                     "这个配方不支持一键取料"));
         }
-        List<ItemStack> missing = findMissing(mcRecipe, MaterialAvailability.collectAvailable(menu));
+        List<ItemStack> missing = findMissing(mcRecipe,
+                MaterialAvailability.collectAvailable(menu, Minecraft.getInstance().player));
         // 快照只用于 JEI 的悬停提示；真正点击时必须交给服务端重新读取存储，
         // 否则箱子刚被漏斗补料就会被旧快照误判为缺料。
         if (!missing.isEmpty() && !doTransfer) {
             return userError(missing.size(), Component.translatableWithFallback(
                     "gui." + SmartWorkbenchMod.MOD_ID + ".msg.transfer_missing",
-                    "接入存储里还缺 %s 种材料", missing.size()));
+                    "接入存储和背包里还缺 %s 种材料", missing.size()));
         }
         if (doTransfer) {
             ResourceLocation id = mcRecipe.getId();
@@ -327,7 +328,7 @@ public final class JeiTransferBridge {
         if (player != null) {
             player.displayClientMessage(Component.translatableWithFallback(
                     "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough",
-                    "附近存储材料不足"), true);
+                    "附近存储和背包材料不足"), true);
         }
     }
 

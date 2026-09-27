@@ -8,11 +8,13 @@ import cn.blockforge.generated.mod2e8abd21.ModRegistries;
 import cn.blockforge.generated.mod2e8abd21.SmartWorkbenchMod;
 import cn.blockforge.generated.mod2e8abd21.blockentity.SmartWorkbenchBlockEntity;
 import cn.blockforge.generated.mod2e8abd21.gui.GuiLayout;
+import cn.blockforge.generated.mod2e8abd21.network.S2CAutoRefillPacket;
 import cn.blockforge.generated.mod2e8abd21.network.S2CCraftableListPacket;
 import cn.blockforge.generated.mod2e8abd21.network.S2CRecursiveCraftPromptPacket;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.NonNullList;
+import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
@@ -23,7 +25,6 @@ import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.entity.player.StackedContents;
 import net.minecraft.world.inventory.ContainerLevelAccess;
 import net.minecraft.world.inventory.CraftingContainer;
-import net.minecraft.world.inventory.DataSlot;
 import net.minecraft.world.inventory.CraftingMenu;
 import net.minecraft.world.inventory.MenuType;
 import net.minecraft.world.inventory.RecipeBookType;
@@ -42,6 +43,7 @@ import net.minecraftforge.common.crafting.IShapedRecipe;
 import net.minecraftforge.event.ForgeEventFactory;
 import net.minecraftforge.items.IItemHandler;
 import net.minecraftforge.items.ItemHandlerHelper;
+import net.minecraftforge.items.wrapper.PlayerMainInvWrapper;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -75,6 +77,14 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     /** 左侧「自动补齐」开关。 */
     public static final int BUTTON_AUTO_REFILL = 1;
 
+    /**
+     * 自动补齐开关在玩家存档上的键。
+     * <p>
+     * 存在玩家身上而不是菜单上：菜单每次打开都会新建一个，开关放在菜单里就永远是默认值，
+     * 玩家关掉之后再开界面又自己打开了。存到玩家持久数据后，关一次就一直记住。
+     */
+    private static final String AUTO_REFILL_TAG = "SmartWorkbenchAutoRefill";
+
     /** 合成格行列数也取自 GuiLayout，改 json 就能整体放大/缩小合成区 */
     private static final int COLUMNS = GuiLayout.GRID_COLS;
     private static final int ROWS = GuiLayout.GRID_ROWS;
@@ -106,6 +116,14 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     private final SmartWorkbenchBlockEntity bench;
     private final CraftingContainer matrix;
     private final ResultContainer resultSlots = new ResultContainer();
+    /**
+     * 玩家自身背包（主背包 + 快捷栏）的处理器。
+     * <p>
+     * 很多玩家习惯把材料直接放身上，所以除了箱子/背包之外，玩家自己的物品栏也是一路料源。
+     * 用 {@link PlayerMainInvWrapper} 只覆盖 0~35 号槽，不会把身上穿的盔甲也拿去当材料。
+     * 菜单是每个玩家各一份的，所以这路料源只对当前打开界面的玩家生效。
+     */
+    private final IItemHandler playerInventoryHandler;
     /** 合成格中由存储取来的材料来源；切换配方时优先退回原槽位。 */
     private final List<SourcePart>[] matrixSources = createSourceLists();
     private boolean updatingMatrix;
@@ -126,8 +144,12 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     private List<CraftableEntry> craftables = List.of();
     /** 普通点击缺料时是否询问并自动递归补齐中间材料。 */
     private boolean autoRefillEnabled = true;
+    /** 服务端是否已经把开关的真实状态发过给客户端；开界面后补一次，之后靠按钮回包同步。 */
+    private boolean autoRefillSynced;
     /** 客户端专用的接入存储快照，给 REI 判断「原料够不够」用 */
     private List<ItemStack> clientStorageStacks = List.of();
+    /** 客户端是否已经收到过服务器推来的存储快照；没收到时缺料判断不可信。 */
+    private boolean clientStorageSynced;
     /** 客户端显示用；服务端的真实数量仍从方块实体读取。 */
     private int clientConnectedStorageCount;
     /** 客户端显示用：绑定的输出容器数量。 */
@@ -160,6 +182,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         super(containerId, inventory, ContainerLevelAccess.create(inventory.player.level(), pos));
         this.level = inventory.player.level();
         this.player = inventory.player;
+        this.playerInventoryHandler = new PlayerMainInvWrapper(inventory);
         this.benchPos = pos;
         this.bench = this.level.getBlockEntity(pos) instanceof SmartWorkbenchBlockEntity entity ? entity : null;
 
@@ -196,17 +219,14 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             this.addSlot(new Slot(inventory, col,
                     GuiLayout.HOTBAR_ITEM_X + col * GuiLayout.HOTBAR_PITCH, GuiLayout.HOTBAR_ITEM_Y));
         }
-        this.addDataSlot(new DataSlot() {
-            @Override
-            public int get() {
-                return SmartWorkbenchMenu.this.autoRefillEnabled ? 1 : 0;
+        // 自动补齐开关跟着玩家存档走：读上一次的选择，没存过才用默认的「开」。
+        // 客户端这半边读不到也不怕，服务端打开界面时会用 S2CAutoRefillPacket 明确补一次。
+        if (!this.level.isClientSide) {
+            CompoundTag data = inventory.player.getPersistentData();
+            if (data.contains(AUTO_REFILL_TAG)) {
+                this.autoRefillEnabled = data.getBoolean(AUTO_REFILL_TAG);
             }
-
-            @Override
-            public void set(int value) {
-                SmartWorkbenchMenu.this.autoRefillEnabled = value != 0;
-            }
-        });
+        }
     }
 
     /**
@@ -287,10 +307,32 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     /** 服务器推来的接入存储快照（同类已合并），REI 的缺料判断会用到。 */
     public void setClientStorageStacks(List<ItemStack> stacks) {
         this.clientStorageStacks = stacks;
+        this.clientStorageSynced = true;
     }
 
     public List<ItemStack> getClientStorageStacks() {
         return this.clientStorageStacks;
+    }
+
+    /** 客户端有没有拿到过这份存储快照。没拿到之前，「缺料」的结论是不准的。 */
+    public boolean hasClientStorageSnapshot() {
+        return this.clientStorageSynced;
+    }
+
+    /**
+     * 合成可用的全部料源：接入的容器（扳手绑定 + 附近扫描 + 里面的背包）在前，
+     * 玩家自己的背包在最后。因为玩家背包排在后面，箱子里的材料会优先被用掉，
+     * 身上的材料留到最后，符合“先花箱子里的存货”的直觉。
+     */
+    private List<IItemHandler> inputHandlers() {
+        List<IItemHandler> handlers = new ArrayList<>();
+        if (this.bench != null) {
+            handlers.addAll(this.bench.getStorages());
+        }
+        if (this.playerInventoryHandler != null) {
+            handlers.add(this.playerInventoryHandler);
+        }
+        return handlers;
     }
 
     public boolean hasRecursivePrompt() {
@@ -512,7 +554,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
 
         // 2) 缺的从接入的存储里补；工作台已有材料优先，真正多出来的最后才退回原容器。
         this.bench.refreshStorages(true);
-        StoragePool pool = StoragePool.collect(this.bench.getStorages());
+        StoragePool pool = StoragePool.collect(inputHandlers());
         int pulled = 0;
         ForgeHooks.setCraftingPlayer(player);
         try {
@@ -623,6 +665,15 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     @Override
     public void broadcastChanges() {
         if (!this.level.isClientSide) {
+            // 界面刚打开时补一包开关状态：客户端菜单是新建的，默认「开」，
+            // 而玩家存档里可能是「关」，必须明确告诉他一次。
+            if (!this.autoRefillSynced) {
+                this.autoRefillSynced = true;
+                if (this.player instanceof ServerPlayer serverPlayer) {
+                    ModNetwork.sendToPlayer(serverPlayer,
+                            new S2CAutoRefillPacket(this.benchPos, this.autoRefillEnabled));
+                }
+            }
             String signature = matrixSignature();
             if (!signature.equals(this.matrixSignature)) {
                 this.matrixSignature = signature;
@@ -827,6 +878,13 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         }
         if (id == BUTTON_AUTO_REFILL && stillValid(player)) {
             this.autoRefillEnabled = !this.autoRefillEnabled;
+            if (player instanceof ServerPlayer serverPlayer) {
+                // 写进玩家存档：下次打开界面还是这个状态
+                serverPlayer.getPersistentData().putBoolean(AUTO_REFILL_TAG, this.autoRefillEnabled);
+                // 立刻回包让界面上的按钮文字跟着变（原版 DataSlot 在值为 0 时不发包，靠不住）
+                ModNetwork.sendToPlayer(serverPlayer,
+                        new S2CAutoRefillPacket(this.benchPos, this.autoRefillEnabled));
+            }
             notify(player, this.autoRefillEnabled ? "已开启自动补齐" : "已关闭自动补齐",
                     this.autoRefillEnabled
                             ? "gui." + SmartWorkbenchMod.MOD_ID + ".msg.auto_refill_on"
@@ -879,9 +937,9 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             return;
         }
         this.bench.refreshStorages(true);
-        StoragePool availablePool = StoragePool.collect(this.bench.getStorages());
+        StoragePool availablePool = StoragePool.collect(inputHandlers());
         if (!hasAllIngredients(crafting, availablePool)) {
-            notify(player, "附近存储材料不足", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
+            notify(player, "附近存储和背包材料不足", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
             refreshCraftables(true);
             return;
         }
@@ -943,11 +1001,14 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         this.nextRefreshTick = now + 20L;
         List<CraftableEntry> next = new ArrayList<>();
         List<IItemHandler> storages = this.bench.getStorages();
-        List<ItemStack> storageSnapshot = List.of();
-        if (!storages.isEmpty()) {
-            StoragePool pool = StoragePool.collect(storages);
-            // 先给客户端抄一份合并后的库存快照（用原始数量，不受下面 plan 扣减的影响）
-            storageSnapshot = pool.mergeForClient(STORAGE_SNAPSHOT_LIMIT);
+        // 可合成列表按「接入存储 + 玩家背包」一起算：只放身上、不塞箱子的材料也能列出来。
+        StoragePool pool = StoragePool.collect(inputHandlers());
+        // 推给客户端的快照仍然只抄接入存储：玩家背包在客户端本来就能实时读到，
+        // 把它塞进快照反而会慢一拍，让 REI 误判成缺料或多料。
+        List<ItemStack> storageSnapshot = storages.isEmpty()
+                ? List.of()
+                : StoragePool.collect(storages).mergeForClient(STORAGE_SNAPSHOT_LIMIT);
+        if (!pool.isEmpty()) {
             int max = ModConfig.maxListSize();
             List<CraftingRecipe> recipes = getPlainRecipes();
             for (CraftingRecipe recipe : recipes) {
@@ -1109,7 +1170,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             ForgeHooks.setCraftingPlayer(null);
         }
         if (!matches) {
-            notify(player, "附近存储材料不足，缺少的中间材料可由其他配方合成",
+            notify(player, "附近存储和背包材料不足，缺少的中间材料可由其他配方合成",
                     "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
         }
     }
@@ -1126,14 +1187,14 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             return;
         }
         this.bench.refreshStorages(true);
-        StoragePool pool = StoragePool.collect(this.bench.getStorages());
+        StoragePool pool = StoragePool.collect(inputHandlers());
         int outcome = craftOnce(player, recipe, pool, false);
         if (outcome == CRAFT_OK) {
             notifyFeedback(player, 1);
         } else if (outcome == CRAFT_MISSING) {
-            // Shift 点击只允许消耗当前接入存储中的真实材料，不能把合成格中的材料
+            // Shift 点击只允许消耗真实存在的材料（接入存储 + 玩家背包），不能把合成格中的材料
             // 或递归配方当成额外库存，否则部分材料会被重复计算。
-            notify(player, "附近存储材料不足，缺少的中间材料可由其他配方合成",
+            notify(player, "附近存储和背包材料不足，缺少的中间材料可由其他配方合成",
                     "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
         } else if (outcome == CRAFT_UNSUPPORTED) {
             notify(player, "这个配方不支持一键合成，请点图标取料到合成格",
@@ -1165,11 +1226,11 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         int crafted = 0;
         int outcome = CRAFT_OK;
         for (int guard = 0; guard < MAX_BATCH_CRAFTS; guard++) {
-            StoragePool pool = StoragePool.collect(this.bench.getStorages());
+            StoragePool pool = StoragePool.collect(inputHandlers());
             if (pool.isEmpty()) {
                 outcome = CRAFT_MISSING;
                 if (crafted == 0) {
-                    notify(player, "附近存储材料不足", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
+                    notify(player, "附近存储和背包材料不足", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
                 }
                 break;
             }
@@ -1222,7 +1283,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         returnMatrixMaterials(player);
 
         for (int i = 0; i < limit; i++) {
-            StoragePool pool = StoragePool.collect(this.bench.getStorages());
+            StoragePool pool = StoragePool.collect(inputHandlers());
             if (pool.isEmpty()) {
                 outcome = CRAFT_MISSING;
                 break;
@@ -1237,7 +1298,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
                 break;
             }
             // 直接材料不够：重新读一遍库存，规划整棵依赖树，能补齐就补一次
-            StoragePool planPool = StoragePool.collect(this.bench.getStorages());
+            StoragePool planPool = StoragePool.collect(inputHandlers());
             RecursivePlanState state = new RecursivePlanState(planPool.snapshotStacks());
             if (!planRecipe(recipe, state, 0, new HashSet<>()) || state.steps.isEmpty()
                     || !state.unavailable.isEmpty() || state.autoCraftable.isEmpty()) {
@@ -1265,7 +1326,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         } else if (!missing.isEmpty()) {
             notifyMissing(player, missing, "gui." + SmartWorkbenchMod.MOD_ID + ".msg.missing_base");
         } else {
-            notify(player, "附近存储材料不足", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
+            notify(player, "附近存储和背包材料不足", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
         }
 
         markDirty();
@@ -1283,13 +1344,13 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             return;
         }
         this.bench.refreshStorages(true);
-        StoragePool pool = StoragePool.collect(this.bench.getStorages());
+        StoragePool pool = StoragePool.collect(inputHandlers());
         RecursivePlanState state = new RecursivePlanState(pool.snapshotStacks());
         if (!planRecipe(target, state, 0, new HashSet<>()) || state.steps.isEmpty()) {
             if (!state.unavailable.isEmpty()) {
                 notifyMissing(player, state.unavailable, "gui." + SmartWorkbenchMod.MOD_ID + ".msg.missing_base");
             } else {
-                notify(player, "附近存储材料不足", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
+                notify(player, "附近存储和背包材料不足", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
             }
             return;
         }
@@ -1302,7 +1363,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         if (!state.unavailable.isEmpty()) {
             notifyMissing(player, state.unavailable, "gui." + SmartWorkbenchMod.MOD_ID + ".msg.missing_base");
         } else {
-            notify(player, "附近存储材料不足", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
+            notify(player, "附近存储和背包材料不足", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
         }
     }
 
@@ -1326,7 +1387,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             return;
         }
         this.bench.refreshStorages(true);
-        StoragePool pool = StoragePool.collect(this.bench.getStorages());
+        StoragePool pool = StoragePool.collect(inputHandlers());
         RecursivePlanState state = new RecursivePlanState(pool.snapshotStacks());
         if (!planRecipe(target, state, 0, new HashSet<>()) || !state.unavailable.isEmpty()
                 || state.autoCraftable.isEmpty()) {
@@ -1695,7 +1756,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         int[] plan = pool.isEmpty() ? null : pool.plan(ingredients);
         if (plan == null) {
             if (notifyOnFail) {
-                notify(player, "附近存储材料不足", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
+                notify(player, "附近存储和背包材料不足", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
             }
             return CRAFT_MISSING;
         }
@@ -1717,7 +1778,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
                 if (got.isEmpty()) {
                     refund(pool, pulled, pulledFrom, player);
                     if (notifyOnFail) {
-                        notify(player, "附近存储材料不足", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
+                        notify(player, "附近存储和背包材料不足", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
                     }
                     return CRAFT_MISSING;
                 }

@@ -5,6 +5,7 @@ import cn.blockforge.generated.mod2e8abd21.ModRegistries;
 import cn.blockforge.generated.mod2e8abd21.SmartWorkbenchMod;
 import cn.blockforge.generated.mod2e8abd21.menu.SmartWorkbenchMenu;
 import cn.blockforge.generated.mod2e8abd21.network.C2SPlaceRecipePacket;
+import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.util.FormattedCharSequence;
@@ -214,7 +215,7 @@ public final class EmiTransferBridge {
             List<Object> stacks = new ArrayList<>();
             SmartWorkbenchMenu menu = activeMenu;
             if (menu != null) {
-                for (ItemStack stack : MaterialAvailability.collectAvailable(menu)) {
+                for (ItemStack stack : MaterialAvailability.collectAvailable(menu, Minecraft.getInstance().player)) {
                     Object emiStack = stackOfMethod.invoke(null, stack);
                     if (emiStack != null) {
                         stacks.add(emiStack);
@@ -288,7 +289,7 @@ public final class EmiTransferBridge {
             boolean craftable = menu != null;
             if (!craftable) {
                 Component message = Component.translatableWithFallback(
-                        "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough", "附近存储材料不足");
+                        "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough", "附近存储和背包材料不足");
                 Object tooltip = tooltipFor(method, message);
                 if (tooltip != null) {
                     result.add(tooltip);
