@@ -22,7 +22,6 @@ public final class SmartWorkbenchMod {
         ModRegistries.register(bus);
         ModConfig.register();
         ModNetwork.register();
-        bus.addListener(ModRegistries::addToCreativeTab);
         bus.addListener(this::onClientSetup);
     }
 

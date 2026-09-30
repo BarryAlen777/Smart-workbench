@@ -71,8 +71,14 @@ public final class GuiLayout {
     public static final int LIST_ROWS = 5;
 
     /* 列表标题 */
-    public static final int LIST_TITLE_X = 232;
+    public static final int LIST_TITLE_X = 197;
     public static final int LIST_TITLE_Y = 16;
+
+    /* 搜索框 */
+    public static final int SEARCH_X = 213;
+    public static final int SEARCH_Y = 13;
+    public static final int SEARCH_WIDTH = 70;
+    public static final int SEARCH_HEIGHT = 12;
 
     /* 滚动条 */
     public static final int SCROLL_X = 276;
@@ -81,14 +87,20 @@ public final class GuiLayout {
     /* 刷新按钮 */
     public static final int BTN_X = 182;
     public static final int BTN_Y = 126;
-    public static final int BTN_WIDTH = 44;
+    public static final int BTN_WIDTH = 30;
     public static final int BTN_HEIGHT = 13;
 
     /* 自动合成按钮 */
-    public static final int BTN_AUTO_X = 230;
+    public static final int BTN_AUTO_X = 214;
     public static final int BTN_AUTO_Y = 126;
-    public static final int BTN_AUTO_WIDTH = 44;
+    public static final int BTN_AUTO_WIDTH = 30;
     public static final int BTN_AUTO_HEIGHT = 13;
+
+    /* 同类折叠开关 */
+    public static final int BTN_FOLD_X = 246;
+    public static final int BTN_FOLD_Y = 126;
+    public static final int BTN_FOLD_WIDTH = 30;
+    public static final int BTN_FOLD_HEIGHT = 13;
 
     /* 自动补齐开关 */
     public static final int BTN_REFILL_X = 92;

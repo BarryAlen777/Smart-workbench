@@ -4,16 +4,19 @@ import cn.blockforge.generated.mod2e8abd21.block.SmartWorkbenchBlock;
 import cn.blockforge.generated.mod2e8abd21.blockentity.SmartWorkbenchBlockEntity;
 import cn.blockforge.generated.mod2e8abd21.item.WrenchItem;
 import cn.blockforge.generated.mod2e8abd21.menu.SmartWorkbenchMenu;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.network.chat.Component;
 import net.minecraft.world.inventory.MenuType;
 import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.CreativeModeTab;
 import net.minecraft.world.item.CreativeModeTabs;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.entity.BlockEntityType;
 import net.minecraft.world.level.block.state.BlockBehaviour;
 import net.minecraft.world.level.material.MapColor;
 import net.minecraftforge.common.extensions.IForgeMenuType;
-import net.minecraftforge.event.BuildCreativeModeTabContentsEvent;
 import net.minecraftforge.eventbus.api.IEventBus;
 import net.minecraftforge.registries.DeferredRegister;
 import net.minecraftforge.registries.ForgeRegistries;
@@ -32,6 +35,8 @@ public final class ModRegistries {
             DeferredRegister.create(ForgeRegistries.Keys.BLOCK_ENTITY_TYPES, SmartWorkbenchMod.MOD_ID);
     public static final DeferredRegister<MenuType<?>> MENUS =
             DeferredRegister.create(ForgeRegistries.Keys.MENU_TYPES, SmartWorkbenchMod.MOD_ID);
+    public static final DeferredRegister<CreativeModeTab> CREATIVE_TABS =
+            DeferredRegister.create(Registries.CREATIVE_MODE_TAB, SmartWorkbenchMod.MOD_ID);
 
     public static final RegistryObject<SmartWorkbenchBlock> SMART_WORKBENCH =
             BLOCKS.register("smart_workbench", () -> new SmartWorkbenchBlock(
@@ -49,6 +54,23 @@ public final class ModRegistries {
             ITEMS.register("wrench",
                     () -> new WrenchItem(new Item.Properties().stacksTo(1)));
 
+    /** 只用作创造标签页图标的隐藏物品：不放进任何标签页，正常游玩拿不到。 */
+    public static final RegistryObject<Item> CREATIVE_TAB_ICON =
+            ITEMS.register("creative_tab_icon",
+                    () -> new Item(new Item.Properties()));
+
+    /** 独立创造标签页：工作台和扳手都收在这里，图标用玩家提供的渲染图。 */
+    public static final RegistryObject<CreativeModeTab> MAIN_TAB = CREATIVE_TABS.register("main",
+            () -> CreativeModeTab.builder()
+                    .title(Component.translatable("itemGroup.smart_workbench"))
+                    .icon(() -> new ItemStack(CREATIVE_TAB_ICON.get()))
+                    .displayItems((parameters, output) -> {
+                        output.accept(SMART_WORKBENCH_ITEM.get());
+                        output.accept(WRENCH.get());
+                    })
+                    .withTabsBefore(CreativeModeTabs.FUNCTIONAL_BLOCKS)
+                    .build());
+
     public static final RegistryObject<BlockEntityType<SmartWorkbenchBlockEntity>> SMART_WORKBENCH_ENTITY =
             BLOCK_ENTITIES.register("smart_workbench",
                     () -> BlockEntityType.Builder.of(SmartWorkbenchBlockEntity::new, SMART_WORKBENCH.get()).build(null));
@@ -64,14 +86,6 @@ public final class ModRegistries {
         ITEMS.register(bus);
         BLOCK_ENTITIES.register(bus);
         MENUS.register(bus);
-    }
-
-    /** 工作台放进“功能方块”，扳手放进“工具与实用物品”。 */
-    public static void addToCreativeTab(BuildCreativeModeTabContentsEvent event) {
-        if (event.getTabKey() == CreativeModeTabs.FUNCTIONAL_BLOCKS) {
-            event.accept(SMART_WORKBENCH_ITEM.get());
-        } else if (event.getTabKey() == CreativeModeTabs.TOOLS_AND_UTILITIES) {
-            event.accept(WRENCH.get());
-        }
+        CREATIVE_TABS.register(bus);
     }
 }

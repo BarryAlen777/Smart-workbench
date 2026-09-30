@@ -76,6 +76,8 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     public static final int BUTTON_REFRESH = 0;
     /** 左侧「自动补齐」开关。 */
     public static final int BUTTON_AUTO_REFILL = 1;
+    /** 产物格上的 Ctrl+左键：把合成格里摆好的这份配方批量合成（材料不论来源，手动摆的也算）。 */
+    public static final int BUTTON_BATCH_GRID = 2;
 
     /**
      * 自动补齐开关在玩家存档上的键。
@@ -115,6 +117,8 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     private final BlockPos benchPos;
     private final SmartWorkbenchBlockEntity bench;
     private final CraftingContainer matrix;
+    /** 合成格的只读料源视图，仅供「可不够合成」这类扫描使用（见 {@link #scanHandlers()}）。 */
+    private final MatrixScanHandler matrixScanHandler;
     private final ResultContainer resultSlots = new ResultContainer();
     /**
      * 玩家自身背包（主背包 + 快捷栏）的处理器。
@@ -138,6 +142,51 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     }
 
     private record SourcePart(ItemStack stack, StoragePool.Source source) {
+    }
+
+    /**
+     * 合成格的只读 IItemHandler 视图：让「材料够不够」的模拟扫描把格子里的东西也当成库存。
+     * <p>
+     * extractItem 一律返回空——真正抽料必须走 {@code placeRecipeIntoGrid} /
+     * {@code returnMatrixMaterials} 那两条会同步维护来源记录（matrixSources）的路，
+     * 直接从这里掏东西会让格子来路和退料对不上账。insertItem 永远整份退回，表示"这格不收料"。
+     */
+    private static final class MatrixScanHandler implements IItemHandler {
+        private final CraftingContainer matrix;
+
+        private MatrixScanHandler(CraftingContainer matrix) {
+            this.matrix = matrix;
+        }
+
+        @Override
+        public int getSlots() {
+            return matrix.getContainerSize();
+        }
+
+        @Override
+        public ItemStack getStackInSlot(int slot) {
+            return matrix.getItem(slot);
+        }
+
+        @Override
+        public ItemStack insertItem(int slot, ItemStack stack, boolean simulate) {
+            return stack;
+        }
+
+        @Override
+        public ItemStack extractItem(int slot, int amount, boolean simulate) {
+            return ItemStack.EMPTY;
+        }
+
+        @Override
+        public int getSlotLimit(int slot) {
+            return 64;
+        }
+
+        @Override
+        public boolean isItemValid(int slot, ItemStack stack) {
+            return false;
+        }
     }
 
     private String matrixSignature = "";
@@ -172,6 +221,18 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     private CraftingRecipe preferredRecipe;
     /** 上一次算产物用的配方：拿走产物时要按同一份配方算剩余物（桶、瓶子之类）。 */
     private CraftingRecipe lastGridRecipe;
+    /**
+     * 「连续合成」锁定的配方：只有 REI/JEI/EMI 的加号、原版配方书、右侧列表这些
+     * <b>明确点配方</b>摆进合成格的料才算数；玩家一格一格手动摆的料不算
+     * （见 {@link #beginStickyRecipe}）。拿走产物后按它自动补一份同样的材料，
+     * 这样点一次加号就能连续合成，不用反复回 REI 重新点开配方。
+     * <p>
+     * 手动摆的料想要一口气合成很多个，用产物格上的 Ctrl+左键批量合成
+     * （{@link #batchCraftFromGrid}）——那条路看的是格子里摆的配方，不问材料来源。
+     */
+    private CraftingRecipe stickyRecipe;
+    /** 锁定时用的是不是「摆满」取料（Shift+加号）：补料时补到同样的量。 */
+    private boolean stickyStackAll;
 
     /** 客户端工厂：从网络缓冲区读工作台坐标。 */
     public SmartWorkbenchMenu(int containerId, Inventory inventory, FriendlyByteBuf buf) {
@@ -195,6 +256,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
                 // 客户端区块没加载等情况用临时列表顶上，物品照样能靠服务端同步显示
                 : NonNullList.withSize(SmartWorkbenchBlockEntity.GRID_SIZE, ItemStack.EMPTY);
         this.matrix = new TransientCraftingContainer(this, COLUMNS, ROWS, grid);
+        this.matrixScanHandler = new MatrixScanHandler(this.matrix);
 
         // 槽位坐标全部引用 GuiLayout：它和 GUI 贴图出自同一份 gui_layout.json（见 tools/gen_gui_texture.py），
         // 所以贴图上的格子框一定落在这些坐标上，不会再出现"贴图和槽位错位"。
@@ -247,8 +309,22 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         public void set(ItemStack stack) {
             if (!SmartWorkbenchMenu.this.updatingMatrix) {
                 SmartWorkbenchMenu.this.matrixSources[this.getContainerSlot()].clear();
+                // 玩家自己动手往格子里放/挪了东西：连续合成的约定作废
+                SmartWorkbenchMenu.this.clearStickyRecipe();
             }
             super.set(stack);
+        }
+
+        @Override
+        public ItemStack remove(int amount) {
+            SmartWorkbenchMenu.this.clearStickyRecipe();
+            return super.remove(amount);
+        }
+
+        @Override
+        public void onTake(Player player, ItemStack stack) {
+            SmartWorkbenchMenu.this.clearStickyRecipe();
+            super.onTake(player, stack);
         }
     }
 
@@ -335,6 +411,24 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         return handlers;
     }
 
+    /**
+     * 「能不能合成」这类<b>只读</b>扫描用的料源：{@link #inputHandlers()} 再加上合成格自己。
+     * <p>
+     * 点一下列表把材料整份搬进合成格之后，箱子和背包可能已经一滴不剩——这时工作台<b>自己身上</b>
+     * （合成格里的料）就是唯一的库存。以前扫描不算合成格，右侧列表会整屏清空，连用同一批料
+     * 还能做出的别的东西也看不见了。把合成格算进来之后，切配方来回挑选都不用先把料退回去。
+     * <p>
+     * 真正要抽料、退料的路径（Shift 直接合成、Ctrl 批量、自动合成）仍然只用 {@link #inputHandlers()}：
+     * 它们会绕过合成格的来源记录（matrixSources）直接改格子，退料时就对不上账。合成格对这几条路径
+     * 的可用材料贡献不受影响——它们开工前都先 {@code returnMatrixMaterials} 把料退回原容器/背包，
+     * 再按整份库存来算，不会重复计数。
+     */
+    private List<IItemHandler> scanHandlers() {
+        List<IItemHandler> handlers = inputHandlers();
+        handlers.add(this.matrixScanHandler);
+        return handlers;
+    }
+
     public boolean hasRecursivePrompt() {
         return this.recursivePromptRecipeId != null;
     }
@@ -385,6 +479,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             setMatrixInternal(slot, ItemStack.EMPTY);
         }
         clearMatrixSources();
+        clearStickyRecipe();
         markDirty();
         this.matrixSignature = matrixSignature();
     }
@@ -502,6 +597,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         markDirty();
         rememberSelection(player, crafting);
         updateResult();
+        beginStickyRecipe(player, crafting, placeAll);
         this.matrixSignature = matrixSignature();
         refreshCraftables(false);
     }
@@ -681,6 +777,9 @@ public class SmartWorkbenchMenu extends CraftingMenu {
                     this.bench.setChanged();
                 }
                 updateResult();
+                // 可合成列表现在也算合成格里的料：格子里东西一变，列表就得跟上，
+                // 把节流窗口清零，让下面那句周期刷新当帧就重算，别再等满一秒。
+                this.nextRefreshTick = 0L;
             }
             if (this.level.getGameTime() >= this.nextRefreshTick) {
                 refreshCraftables(false);
@@ -761,10 +860,11 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         }
         ForgeHooks.setCraftingPlayer(player);
         NonNullList<ItemStack> remaining;
+        CraftingRecipe used;
         try {
             // 按「显示产物时用的同一份配方」算剩余物：同产物配方有好几份时，
             // 原版 getRemainingItemsFor 又会去随便挑一份，可能和刚拿走的产物对不上。
-            CraftingRecipe used = this.lastGridRecipe;
+            used = this.lastGridRecipe;
             remaining = used != null && used.matches(this.matrix, this.level)
                     ? used.getRemainingItems(this.matrix)
                     : this.level.getRecipeManager().getRemainingItemsFor(RecipeType.CRAFTING, this.matrix, this.level);
@@ -797,8 +897,76 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         }
         markDirty();
         updateResult();
+        refillStickyAfterCraft(player, used);
         this.matrixSignature = matrixSignature();
         refreshCraftables(false);
+    }
+
+    /**
+     * 记下「连续合成」锁定的配方：只在材料是从 REI/配方书/右侧列表一键摆进格子的、
+     * 并且摆完真能出产物时成立。手动一格一格摆的料走不到这里，也就不会被自动补料。
+     */
+    private void beginStickyRecipe(ServerPlayer player, CraftingRecipe recipe, boolean stackAll) {
+        if (recipe == null || recipe.getId() == null) {
+            this.stickyRecipe = null;
+            return;
+        }
+        ForgeHooks.setCraftingPlayer(player);
+        boolean matches;
+        try {
+            matches = recipe.matches(this.matrix, this.level);
+        } finally {
+            ForgeHooks.setCraftingPlayer(null);
+        }
+        if (!matches) {
+            this.stickyRecipe = null;
+            return;
+        }
+        this.stickyRecipe = recipe;
+        this.stickyStackAll = stackAll;
+    }
+
+    private void clearStickyRecipe() {
+        this.stickyRecipe = null;
+        this.stickyStackAll = false;
+    }
+
+    /**
+     * 合成拿走产物后，按锁定的配方把同样的材料再补进合成格，让玩家能一口气合成很多次
+     * （这就是「点一次 REI 加号只能合成一次」的解药）。
+     * <p>
+     * 只在<b>凑得齐完整一份</b>时才补：凑不齐就干脆不动，免得从仓库里掏出一半材料
+     * 卡在格子里。背包 + 接入存储 + 格子里剩下的料加在一起算，够就补。
+     */
+    private void refillStickyAfterCraft(Player player, CraftingRecipe justUsed) {
+        if (this.stickyRecipe == null || this.bench == null) {
+            return;
+        }
+        if (!(player instanceof ServerPlayer serverPlayer)) {
+            return;
+        }
+        if (justUsed == null || justUsed.getId() == null
+                || !justUsed.getId().equals(this.stickyRecipe.getId())) {
+            // 刚合成的不是锁定的那一份（比如用多态按钮换了配方）：约定作废，别再自动补
+            clearStickyRecipe();
+            return;
+        }
+        Recipe<?> fresh = this.level.getRecipeManager().byKey(this.stickyRecipe.getId()).orElse(null);
+        if (!(fresh instanceof CraftingRecipe crafting) || !isPlainCraft(crafting)) {
+            clearStickyRecipe();
+            return;
+        }
+        this.stickyRecipe = crafting;
+        this.bench.refreshStorages(true);
+        StoragePool available = StoragePool.collect(scanHandlers());
+        if (available.isEmpty() || !hasAllIngredients(crafting, available)) {
+            clearStickyRecipe();
+            return;
+        }
+        placeRecipeIntoGrid(serverPlayer, crafting, this.stickyStackAll);
+        rememberSelection(serverPlayer, crafting);
+        markDirty();
+        updateResult();
     }
 
     /* 快捷移动 */
@@ -819,6 +987,8 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             if (!this.moveItemStackTo(slotStack, GRID_START, GRID_END, false)) {
                 return ItemStack.EMPTY;
             }
+            // 玩家自己把身上的料甩进合成格：这一下属于手动摆放，连续合成约定作废
+            clearStickyRecipe();
         } else if (!movingFromGrid || !this.moveItemStackTo(slotStack, INV_START, INV_END, true)) {
             return ItemStack.EMPTY;
         }
@@ -891,6 +1061,13 @@ public class SmartWorkbenchMenu extends CraftingMenu {
                             : "gui." + SmartWorkbenchMod.MOD_ID + ".msg.auto_refill_off");
             return true;
         }
+        if (id == BUTTON_BATCH_GRID && player instanceof ServerPlayer serverPlayer && stillValid(player)) {
+            if (!acceptAction(serverPlayer)) {
+                return false;
+            }
+            batchCraftFromGrid(serverPlayer);
+            return true;
+        }
         return false;
     }
 
@@ -937,7 +1114,9 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             return;
         }
         this.bench.refreshStorages(true);
-        StoragePool availablePool = StoragePool.collect(inputHandlers());
+        // 预检要算上合成格里已有的料：placeRecipeIntoGrid 本来就会优先复用格子里现成的材料，
+        // 预检却只看箱子和背包的话，会出现"明明够、报缺料"的对不上账。
+        StoragePool availablePool = StoragePool.collect(scanHandlers());
         if (!hasAllIngredients(crafting, availablePool)) {
             notify(player, "附近存储和背包材料不足", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
             refreshCraftables(true);
@@ -947,6 +1126,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         markDirty();
         rememberSelection(player, crafting);
         updateResult();
+        beginStickyRecipe(player, crafting, stackAll);
         this.matrixSignature = matrixSignature();
         refreshCraftables(false);
     }
@@ -984,6 +1164,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             this.matrixSources[slot].clear();
             setMatrixFromMenu(slot, ItemStack.EMPTY);
         }
+        clearStickyRecipe();
         markDirty();
         updateResult();
         this.matrixSignature = matrixSignature();
@@ -1001,8 +1182,9 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         this.nextRefreshTick = now + 20L;
         List<CraftableEntry> next = new ArrayList<>();
         List<IItemHandler> storages = this.bench.getStorages();
-        // 可合成列表按「接入存储 + 玩家背包」一起算：只放身上、不塞箱子的材料也能列出来。
-        StoragePool pool = StoragePool.collect(inputHandlers());
+        // 可合成列表按「接入存储 + 玩家背包 + 合成格自身」一起算：只放身上、不塞箱子的材料能列出来，
+        // 一键取料搬进合成格后（箱子和背包可能已经掏空），格子里的料也还能撑起别的配方。
+        StoragePool pool = StoragePool.collect(scanHandlers());
         // 推给客户端的快照仍然只抄接入存储：玩家背包在客户端本来就能实时读到，
         // 把它塞进快照反而会慢一拍，让 REI 误判成缺料或多料。
         List<ItemStack> storageSnapshot = storages.isEmpty()
@@ -1170,8 +1352,12 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             ForgeHooks.setCraftingPlayer(null);
         }
         if (!matches) {
+            clearStickyRecipe();
             notify(player, "附近存储和背包材料不足，缺少的中间材料可由其他配方合成",
                     "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
+        } else {
+            // 普通点击列表 = 明确选了这份配方，和 REI 加号一样享受「合成后自动补料」
+            beginStickyRecipe(player, recipe, false);
         }
     }
 
@@ -1246,6 +1432,59 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         }
         markDirty();
         updateResult();
+        refreshCraftables(true);
+    }
+
+    /**
+     * 产物格上的 Ctrl+左键：把合成格里<b>已经摆好的这份配方</b>批量合成。
+     * <p>
+     * 材料从哪来的不重要——REI 加号摆进来的、右侧列表点进来的、自己一格一格
+     * 从背包里拖进来的，只要格子里能出产物，就按这份配方一直做到材料用完。
+     * 格子里现成的料会先退回（来源记录的回原容器，手动放的回背包），再和
+     * 接入存储、背包一起按「整份库存」反复取材，产物进背包。
+     */
+    private void batchCraftFromGrid(ServerPlayer player) {
+        if (this.bench == null) {
+            return;
+        }
+        updateResult();
+        CraftingRecipe recipe = this.lastGridRecipe;
+        if (recipe == null || recipe.getId() == null || this.resultSlots.getItem(0).isEmpty()) {
+            notify(player, "合成格里还没有能合成的配方", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.grid_empty");
+            return;
+        }
+        if (!isPlainCraft(recipe)) {
+            notify(player, "这个配方不支持一键合成，请点图标取料到合成格",
+                    "gui." + SmartWorkbenchMod.MOD_ID + ".msg.unsupported");
+            return;
+        }
+        this.activeFeedback = new CraftFeedback();
+        // 格子里的料也算库存：先整份退回（来源记录的回原容器，手动放的回背包），
+        // 之后每一轮都按「接入存储 + 背包」取材，刚退回的那份一定会被用上，不会被丢掉。
+        returnMatrixMaterials(player);
+        this.bench.refreshStorages(true);
+        int crafted = 0;
+        for (int guard = 0; guard < MAX_BATCH_CRAFTS; guard++) {
+            StoragePool pool = StoragePool.collect(inputHandlers());
+            if (pool.isEmpty()) {
+                if (crafted == 0) {
+                    notify(player, "附近存储和背包材料不足", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
+                }
+                break;
+            }
+            // 只有第一次失败时才提示，中途没料了是正常结束
+            int outcome = craftOnce(player, recipe, pool, crafted == 0);
+            if (outcome != CRAFT_OK) {
+                break;
+            }
+            crafted++;
+        }
+        if (crafted > 0) {
+            notifyFeedback(player, crafted);
+        }
+        markDirty();
+        updateResult();
+        this.matrixSignature = matrixSignature();
         refreshCraftables(true);
     }
 

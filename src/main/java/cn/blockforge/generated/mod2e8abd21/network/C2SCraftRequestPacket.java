@@ -15,7 +15,8 @@ import java.util.function.Supplier;
  * 这里没有走原版的 {@code clickMenuButton}，因为原版按钮通道只适合很少的固定按钮；
  * 自定义包直接传配方 ID，列表刷新或排序后也不会把点击错配到另一条配方。
  * <p>
- * 三种点击：普通 = 把材料配到合成格；Shift = 从存储合成一次；Ctrl = 批量合成直到材料用完。
+ * 三种点击：普通 = 把材料配到合成格；Shift = 从存储合成一次；按住批量合成键（默认 Ctrl，
+ * 玩家可在「选项 → 控制 → 按键绑定」里改）= 批量合成直到材料用完。
  */
 public class C2SCraftRequestPacket {
 
@@ -23,7 +24,7 @@ public class C2SCraftRequestPacket {
     private final ResourceLocation recipeId;
     /** true 表示不经过合成格，直接从接入的存储取材合成 */
     private final boolean craft;
-    /** true 表示反复合成（Ctrl 点击），craft 必为 true */
+    /** true 表示反复合成（按住批量合成键点击），craft 必为 true */
     private final boolean batch;
 
     public C2SCraftRequestPacket(BlockPos pos, ResourceLocation recipeId, boolean craft, boolean batch) {
