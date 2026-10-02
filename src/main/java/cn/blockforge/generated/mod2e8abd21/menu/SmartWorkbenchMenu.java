@@ -203,7 +203,11 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     private int clientConnectedStorageCount;
     /** 客户端显示用：绑定的输出容器数量。 */
     private int clientOutputCount;
-    private String listSignature = "";
+    /** 上次扫描时的库存指纹（含配方版本、输出容器数）。没变就跳过重算，省下大整合包里每秒几千次配方匹配。 */
+    private long craftableFingerprint;
+    private boolean hasCraftableFingerprint;
+    /** 分块收列表用的缓冲：最后一块到了才整体换上，界面不会显示到一半的半截列表。 */
+    private final List<CraftableEntry> clientCraftableBuffer = new ArrayList<>();
     private String storageInputSignature = "";
     private long nextRefreshTick;
     /** 同一个菜单内复用普通合成配方索引，避免递归规划时反复遍历全量配方。 */
@@ -378,6 +382,20 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     /** 服务器算好的列表推给客户端，客户端只负责显示。 */
     public void setClientCraftables(List<CraftableEntry> entries) {
         this.craftables = entries;
+    }
+
+    /**
+     * 分块列表的一段：{@code first} 时清空缓冲，{@code last} 时把拼好的整份换上。
+     * 列表可能好几千条、分包发送，中间帧不能让界面看到只到一半的列表。
+     */
+    public void appendClientCraftables(List<CraftableEntry> entries, boolean first, boolean last) {
+        if (first) {
+            this.clientCraftableBuffer.clear();
+        }
+        this.clientCraftableBuffer.addAll(entries);
+        if (last) {
+            this.craftables = List.copyOf(this.clientCraftableBuffer);
+        }
     }
 
     /** 服务器推来的接入存储快照（同类已合并），REI 的缺料判断会用到。 */
@@ -1180,7 +1198,6 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         }
         this.bench.refreshStorages(forceScan);
         this.nextRefreshTick = now + 20L;
-        List<CraftableEntry> next = new ArrayList<>();
         List<IItemHandler> storages = this.bench.getStorages();
         // 可合成列表按「接入存储 + 玩家背包 + 合成格自身」一起算：只放身上、不塞箱子的材料能列出来，
         // 一键取料搬进合成格后（箱子和背包可能已经掏空），格子里的料也还能撑起别的配方。
@@ -1190,15 +1207,25 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         List<ItemStack> storageSnapshot = storages.isEmpty()
                 ? List.of()
                 : StoragePool.collect(storages).mergeForClient(STORAGE_SNAPSHOT_LIMIT);
+        // 数据包重载会换掉配方索引，先让它把版本号刷新，再和库存一起算指纹
+        List<CraftingRecipe> recipes = getPlainRecipes();
+        long fingerprint = craftableFingerprint(pool, storageSnapshot, storages.size(), getOutputCount());
+        if (this.hasCraftableFingerprint && fingerprint == this.craftableFingerprint) {
+            // 库存、配方、输出容器都没变：列表和客户端手上那份一模一样，不用重算也不用重发
+            return;
+        }
+        this.craftableFingerprint = fingerprint;
+        this.hasCraftableFingerprint = true;
+
+        List<CraftableEntry> next = new ArrayList<>();
         if (!pool.isEmpty()) {
+            // 上限只用来兜住极端整合包（比如把整座仓库都塞满的创造模式测试），
+            // 正常情况下列表是全的——以前 1024 的默认上限会把后面的配方直接截掉，
+            // 玩家搜「樱花木活板门」这类排在后面的东西就会一无所获。
             int max = ModConfig.maxListSize();
-            List<CraftingRecipe> recipes = getPlainRecipes();
             for (CraftingRecipe recipe : recipes) {
                 if (next.size() >= max) {
                     break;
-                }
-                if (!isPlainCraft(recipe)) {
-                    continue;
                 }
                 NonNullList<Ingredient> ingredients = recipe.getIngredients();
                 pool.reset();
@@ -1223,24 +1250,42 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             }
         }
         next.sort(Comparator.comparing(entry -> entry.result().getItem().getDescriptionId()));
-        StringBuilder signature = new StringBuilder();
-        for (CraftableEntry entry : next) {
-            signature.append(entry.signature()).append(';');
+        this.craftables = next;
+        if (this.player instanceof ServerPlayer serverPlayer) {
+            sendCraftableList(serverPlayer, next, storageSnapshot, storages.size(), getOutputCount());
         }
-        // 库存数量变了也得重发，否则 REI 手里的快照会过期，还会误报缺料
-        signature.append('#').append(storages.size()).append(';');
-        signature.append('@').append(this.bench == null ? 0 : this.bench.getOutputBindingCount()).append(';');
-        for (ItemStack stack : storageSnapshot) {
-            signature.append(stack.getItem().getDescriptionId()).append(':').append(stack.getCount())
-                    .append(':').append(stack.getTag()).append(',');
+    }
+
+    /**
+     * 把「库存 + 存储快照 + 输出容器 + 配方版本」揉成一个 64 位指纹。
+     * 指纹一样就说明列表不会变，不必再花几十毫秒重扫配方，也不用重发包。
+     */
+    private long craftableFingerprint(StoragePool pool, List<ItemStack> snapshot, int storageCount, int outputCount) {
+        long hash = pool.fingerprint();
+        hash = hash * 31L + this.recipeIndexVersion;
+        hash = hash * 31L + storageCount;
+        hash = hash * 31L + outputCount;
+        for (ItemStack stack : snapshot) {
+            hash = hash * 31L + stack.getItem().getDescriptionId().hashCode();
+            hash = hash * 31L + stack.getCount();
         }
-        if (!signature.toString().equals(this.listSignature)) {
-            this.listSignature = signature.toString();
-            this.craftables = next;
-            if (this.player instanceof ServerPlayer serverPlayer) {
-                ModNetwork.sendToPlayer(serverPlayer, new S2CCraftableListPacket(
-                        this.benchPos, next, storageSnapshot, storages.size(), getOutputCount()));
-            }
+        return hash;
+    }
+
+    /**
+     * 列表可能有几千条，按固定块大小分成几个网络包依次发：第一块带存储快照，
+     * 客户端累加到「最后一块」才整体换上，避开网络帧 1MB 的硬上限。
+     */
+    private void sendCraftableList(ServerPlayer player, List<CraftableEntry> entries,
+                                   List<ItemStack> snapshot, int storageCount, int outputCount) {
+        int chunkSize = S2CCraftableListPacket.CHUNK_SIZE;
+        int chunkCount = Math.max(1, (entries.size() + chunkSize - 1) / chunkSize);
+        for (int index = 0; index < chunkCount; index++) {
+            int from = Math.min(entries.size(), index * chunkSize);
+            int to = Math.min(entries.size(), from + chunkSize);
+            List<CraftableEntry> chunk = List.copyOf(entries.subList(from, to));
+            ModNetwork.sendToPlayer(player, new S2CCraftableListPacket(this.benchPos, chunk, index, chunkCount,
+                    index == 0 ? snapshot : List.of(), storageCount, outputCount));
         }
     }
 
@@ -1252,9 +1297,22 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         return pool.plan(recipe.getIngredients()) != null;
     }
 
-    /** 只处理能放进 3x3 的普通合成配方，特殊配方（修装备、复制旗帜等）跳过。 */
+    /**
+     * 判断一份配方能不能一键取料 / 批量合成：只要是能放进 3x3、材料表完整的合成配方就行。
+     * <p>
+     * <b>这里刻意不按 {@link CraftingRecipe#isSpecial()} 一刀切。</b>精妙存储的
+     * {@code sophisticatedstorage:storage_tier_upgrade}（把木箱升级成铁箱/金箱/钻石箱，
+     * 同时保留箱子里的物品）把自己标成 special，但它本质仍是一份 shaped 配方：材料表完整、
+     * 结果由 {@code assemble} 在合成格里现算，完全可以一键摆料和批量合成——以前被
+     * {@code isSpecial()} 挡掉，才会出现「点加号说这个配方不支持一键合成」。
+     * <p>
+     * 真正没法自动化的特殊配方（修装备、复制旗帜、染色、烟花、地图扩展等）都是
+     * {@code CustomRecipe} 的子类，它们的材料表本来就是空的，会被下面的
+     * {@code ingredients.isEmpty()} 拦住；即便有别的模组给特殊配方写了材料表，
+     * 取料后也会在 {@code recipe.matches} 复核，不合格就退款并如实提示，不会凭空产出。
+     */
     private boolean isPlainCraft(CraftingRecipe recipe) {
-        if (recipe.isSpecial() || !recipe.canCraftInDimensions(COLUMNS, ROWS)) {
+        if (!recipe.canCraftInDimensions(COLUMNS, ROWS)) {
             return false;
         }
         NonNullList<Ingredient> ingredients = recipe.getIngredients();

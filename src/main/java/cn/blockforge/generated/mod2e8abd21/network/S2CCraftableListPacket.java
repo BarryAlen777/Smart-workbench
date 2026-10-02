@@ -18,6 +18,11 @@ import java.util.function.Supplier;
  * 快照是给 REI 用的：REI 判断「原料够不够」时只看玩家背包和菜单里的槽位，
  * 看不到我们接在 IItemHandler 上的箱子，所以它老喊缺料。拿到快照后，
  * {@code compat} 包里的自定义转移处理器就能把箱子里的材料算进去。
+ * <p>
+ * <b>为什么要分块：</b>大整合包里「能直接合成的东西」动辄好几千条，
+ * 全塞进一个自定义负载包会撞上网络帧 1MB 的硬上限。这里按
+ * {@link #CHUNK_SIZE} 切成若干个包依次发；第一块带存储快照，客户端每块
+ * 累加，最后一块到了才整体换上，界面不会闪出半截列表。
  */
 public class S2CCraftableListPacket {
 
@@ -28,16 +33,27 @@ public class S2CCraftableListPacket {
      */
     private static final int MAX_SNAPSHOT_COUNT = 1_000_000;
 
+    /**
+     * 一个包最多塞多少条配方。按常见经验估算每条约 100~250 字节，600 条约 60~150KB；
+     * 就算碰上结果带大段 NBT 的模组配方，也离网络帧 1MB 的硬上限很远。
+     */
+    public static final int CHUNK_SIZE = 600;
+
     private final BlockPos pos;
     private final List<CraftableEntry> entries;
+    /** 这是第几块、一共几块；只有一块时是 0 / 1。 */
+    private final int chunkIndex;
+    private final int chunkCount;
     private final List<ItemStack> storageStacks;
     private final int storageCount;
     private final int outputCount;
 
-    public S2CCraftableListPacket(BlockPos pos, List<CraftableEntry> entries,
+    public S2CCraftableListPacket(BlockPos pos, List<CraftableEntry> entries, int chunkIndex, int chunkCount,
                                   List<ItemStack> storageStacks, int storageCount, int outputCount) {
         this.pos = pos;
         this.entries = List.copyOf(entries);
+        this.chunkIndex = Math.max(0, chunkIndex);
+        this.chunkCount = Math.max(1, chunkCount);
         this.storageStacks = List.copyOf(storageStacks);
         this.storageCount = Math.max(0, storageCount);
         this.outputCount = Math.max(0, outputCount);
@@ -51,6 +67,8 @@ public class S2CCraftableListPacket {
             list.add(CraftableEntry.read(buf));
         }
         this.entries = List.copyOf(list);
+        this.chunkIndex = buf.readVarInt();
+        this.chunkCount = Math.max(1, buf.readVarInt());
         int storageSize = buf.readVarInt();
         List<ItemStack> storage = new ArrayList<>(storageSize);
         for (int i = 0; i < storageSize; i++) {
@@ -72,6 +90,8 @@ public class S2CCraftableListPacket {
         for (CraftableEntry entry : this.entries) {
             entry.write(buf);
         }
+        buf.writeVarInt(this.chunkIndex);
+        buf.writeVarInt(this.chunkCount);
         buf.writeVarInt(this.storageStacks.size());
         for (ItemStack stack : this.storageStacks) {
             buf.writeItem(stack.copyWithCount(1));
@@ -87,10 +107,13 @@ public class S2CCraftableListPacket {
             Player player = net.minecraft.client.Minecraft.getInstance().player;
             if (player != null && player.containerMenu instanceof cn.blockforge.generated.mod2e8abd21.menu.SmartWorkbenchMenu menu
                     && menu.getBenchPos().equals(this.pos)) {
-                menu.setClientCraftables(this.entries);
-                menu.setClientStorageStacks(this.storageStacks);
-                menu.setClientConnectedStorageCount(this.storageCount);
-                menu.setClientOutputCount(this.outputCount);
+                if (this.chunkIndex == 0) {
+                    // 存储快照只在第一块里，客户端收到就立刻给 REI 用上
+                    menu.setClientStorageStacks(this.storageStacks);
+                    menu.setClientConnectedStorageCount(this.storageCount);
+                    menu.setClientOutputCount(this.outputCount);
+                }
+                menu.appendClientCraftables(this.entries, this.chunkIndex == 0, this.chunkIndex >= this.chunkCount - 1);
             }
         });
         context.setPacketHandled(true);

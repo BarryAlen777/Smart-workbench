@@ -26,18 +26,24 @@ public final class ModConfig {
     public static final ForgeConfigSpec SPEC;
 
     /**
-     * 界面配方列表的硬上限。
+     * 界面配方列表的扫描上限。
      * <p>
-     * 列表每一项都要写进网络包（配方 id + 产物堆叠），4096 项在常见整合包里大约一两百 KB，
-     * 远低于原版网络帧 2MB 的硬限制；再往大就会被服务器每 20 tick 的扫描拖慢。
+     * 列表现在按块分包发送（每包 {@code S2CCraftableListPacket.CHUNK_SIZE} 条），
+     * 不再受单个网络帧的限制，这里的数字只用来兜住「把整座仓库塞满」的极端情况。
+     * 32768 条大致对应几百 KB 的内存和一次性的（只在库存变化时发生的）配方匹配，
+     * 对正常游玩没有可感知的负担。
      */
-    public static final int MAX_LIST_SIZE = 4096;
+    public static final int MAX_LIST_SIZE = 32768;
 
-    /** 新配置的默认列表容量。 */
-    public static final int DEFAULT_LIST_SIZE = 1024;
+    /** 新配置的默认列表容量，足够覆盖常见大整合包的全部可合成项。 */
+    public static final int DEFAULT_LIST_SIZE = 8192;
 
-    /** 1.2.0 之前列表的硬上限；配置里留着这个数说明是旧版本遗留的。 */
-    private static final int LEGACY_LIST_LIMIT = 384;
+    /**
+     * 1.5.x 及之前列表的默认上限。配置里写着这个数（或更小）说明是旧版本的默认值，
+     * 不是玩家自己调过的：旧默认值会把排在后面的配方整批截掉（例如搜不到樱花木活板门），
+     * 所以统一顶到 {@link #DEFAULT_LIST_SIZE}；玩家自己写的大数值照旧尊重。
+     */
+    private static final int LEGACY_LIST_LIMIT = 1024;
 
     public static final ForgeConfigSpec.IntValue SCAN_RANGE;
     public static final ForgeConfigSpec.IntValue PLAYER_BACKPACK_RANGE;
@@ -73,8 +79,8 @@ public final class ModConfig {
                 .defineInRange("maxOutputBindings", 6, 1, 50);
         LIST_SLOTS = builder
                 .comment("一次最多在界面上列出多少个可合成配方。",
-                        "列表是边算边收的：越多人越费服务器算力、同步包也越大，所以给了个 4096 的上限。",
-                        "整合包里配方多、又觉得列表被截断，可以往大调；默认 1024。")
+                        "列表按块分包发送，不受单个网络帧大小限制；这个值只用来兜住极端整合包，",
+                        "上限 32768，默认 8192，正常整合包已经足够列出全部可合成项。")
                 .defineInRange("maxListSize", DEFAULT_LIST_SIZE, 12, MAX_LIST_SIZE);
         STORAGE_BLACKLIST = builder
                 .comment("不接入的方块 ID 列表，例如 [\"minecraft:chest\"]。")
@@ -137,8 +143,8 @@ public final class ModConfig {
 
     public static int maxListSize() {
         int configured = LIST_SLOTS.get();
-        // 老配置里留下的 384 及以下的值是旧版本的硬上限，白白截断列表；
-        // 这一类遗留值统一顶到新默认值，玩家自己写的大数值照旧尊重。
+        // 旧版本默认的 1024（以及更早的 384）都是「没被玩家改过就白白截断列表」的遗留值，
+        // 统一顶到新默认值；玩家自己写的大数值照旧尊重。
         int effective = configured <= LEGACY_LIST_LIMIT ? DEFAULT_LIST_SIZE : configured;
         return Math.max(12, Math.min(MAX_LIST_SIZE, effective));
     }

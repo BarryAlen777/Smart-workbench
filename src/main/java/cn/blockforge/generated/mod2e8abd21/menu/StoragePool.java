@@ -84,6 +84,30 @@ public final class StoragePool {
         return this.size == 0;
     }
 
+    /**
+     * 库存内容的廉价指纹：物品、数量、NBT 和槽位顺序全揉进一个 64 位数。
+     * <p>
+     * 用来判断「这次扫描和上次相比变没变」——一样就不必把上千份配方重新匹配一遍，
+     * 大整合包里每秒一次的列表刷新就不会白烧服务器 CPU。
+     */
+    public long fingerprint() {
+        long hash = 0xcbf29ce484222325L;
+        for (int i = 0; i < this.size; i++) {
+            ItemStack stack = this.stacks[i];
+            if (stack.isEmpty()) {
+                continue;
+            }
+            long h = stack.getCount();
+            h = h * 31L + stack.getItem().getDescriptionId().hashCode();
+            if (stack.getTag() != null) {
+                h = h * 31L + stack.getTag().hashCode();
+            }
+            hash ^= h;
+            hash *= 0x100000001b3L;
+        }
+        return hash;
+    }
+
     /** 规划递归配方时使用的只读库存副本，不会触碰真实存储。 */
     public List<ItemStack> snapshotStacks() {
         List<ItemStack> result = new ArrayList<>(this.size);
