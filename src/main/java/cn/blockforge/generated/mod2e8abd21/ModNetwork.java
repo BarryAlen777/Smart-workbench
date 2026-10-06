@@ -1,5 +1,6 @@
 package cn.blockforge.generated.mod2e8abd21;
 
+import cn.blockforge.generated.mod2e8abd21.network.C2SAutoCraftGridPacket;
 import cn.blockforge.generated.mod2e8abd21.network.C2SAutoCraftPacket;
 import cn.blockforge.generated.mod2e8abd21.network.C2SCraftRequestPacket;
 import cn.blockforge.generated.mod2e8abd21.network.C2SPlaceRecipePacket;
@@ -20,7 +21,7 @@ import net.minecraftforge.network.simple.SimpleChannel;
  */
 public final class ModNetwork {
 
-    private static final String VERSION = "1";
+    private static final String VERSION = "2";
     private static final SimpleChannel INSTANCE = NetworkRegistry.newSimpleChannel(
             new ResourceLocation(SmartWorkbenchMod.MOD_ID, "main"),
             () -> VERSION,
@@ -65,6 +66,11 @@ public final class ModNetwork {
                 .encoder(S2CAutoRefillPacket::encode)
                 .decoder(S2CAutoRefillPacket::new)
                 .consumerNetworkThread(S2CAutoRefillPacket::handle)
+                .add();
+        INSTANCE.messageBuilder(C2SAutoCraftGridPacket.class, 7, NetworkDirection.PLAY_TO_SERVER)
+                .encoder(C2SAutoCraftGridPacket::encode)
+                .decoder(C2SAutoCraftGridPacket::new)
+                .consumerNetworkThread(C2SAutoCraftGridPacket::handle)
                 .add();
     }
 

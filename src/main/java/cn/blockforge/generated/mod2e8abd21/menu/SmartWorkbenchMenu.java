@@ -31,6 +31,7 @@ import net.minecraft.world.inventory.RecipeBookType;
 import net.minecraft.world.inventory.ResultContainer;
 import net.minecraft.world.inventory.Slot;
 import net.minecraft.world.inventory.TransientCraftingContainer;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.crafting.CraftingRecipe;
 import net.minecraft.world.item.crafting.Ingredient;
@@ -45,9 +46,11 @@ import net.minecraftforge.items.IItemHandler;
 import net.minecraftforge.items.ItemHandlerHelper;
 import net.minecraftforge.items.wrapper.PlayerMainInvWrapper;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -93,11 +96,18 @@ public class SmartWorkbenchMenu extends CraftingMenu {
 
     /** 发给客户端的存储快照最多保留多少种物品，防止精妙存储那种大仓库把包撑爆 */
     private static final int STORAGE_SNAPSHOT_LIMIT = 512;
-    /** Ctrl 批量合成一次最多做多少个，防止点一下就把整仓库抽干或卡住 */
-    private static final int MAX_BATCH_CRAFTS = 256;
-    /** 递归补齐最多展开这么多次，避免错误配方或循环配方拖住服务器。 */
-    private static final int MAX_RECURSIVE_STEPS = 256;
-    private static final int MAX_RECURSIVE_DEPTH = 16;
+    /** 批量合成一次最多做多少次；数量框和配置「用完材料」都受这个安全上限保护。 */
+    private static final int MAX_BATCH_CRAFTS = 1024;
+
+    /**
+     * 本次操作已经尝试的规划节点数与是否因预算用尽而中止。
+     * <p>
+     * 递归深度、展开步数、节点预算都放在配置里（{@code craft.recursiveMaxDepth} 等），
+     * 免得又深又绕的配方树把服务器拖住。每次「顶层规划」都从零开始计数，
+     * 递归调用共享同一份计数。
+     */
+    private int planNodes;
+    private boolean planAborted;
 
     /** 客户端正在显示的“自动补齐”确认框；服务端不会依赖这些字段做权限判断。 */
     private ResourceLocation recursivePromptRecipeId;
@@ -213,6 +223,8 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     /** 同一个菜单内复用普通合成配方索引，避免递归规划时反复遍历全量配方。 */
     private List<CraftingRecipe> plainRecipes;
     private Map<net.minecraft.world.item.Item, List<CraftingRecipe>> recipesByResult;
+    /** 按材料种类反向索引配方，给链式可达性扫描用。 */
+    private Map<net.minecraft.world.item.Item, List<CraftingRecipe>> recipesUsingItem;
     private long recipeIndexVersion = Long.MIN_VALUE;
     /** 所有客户端操作共用一个服务端冷却，防止连点堆积主线程任务。 */
     private long nextActionTick;
@@ -611,6 +623,14 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             // 特殊配方（修装备、复制旗帜之类）不接管
             return;
         }
+        if (this.autoRefillEnabled) {
+            this.bench.refreshStorages(true);
+            if (!hasAllIngredients(crafting, StoragePool.collect(scanHandlers()))) {
+                // 直接材料不齐但开了自动补齐：先链式补做中间材料，再摆这份配方
+                pullChainFromStorage(player, crafting);
+                return;
+            }
+        }
         placeRecipeIntoGrid(player, crafting, placeAll);
         markDirty();
         rememberSelection(player, crafting);
@@ -630,6 +650,15 @@ public class SmartWorkbenchMenu extends CraftingMenu {
      * 返回从存储里实际取出的件数。
      */
     private int placeRecipeIntoGrid(ServerPlayer player, CraftingRecipe recipe, boolean placeAll) {
+        return placeRecipeIntoGrid(player, recipe, placeAll, null);
+    }
+
+    /**
+     * 摆配方进合成格。{@code preloaded} 是链式补做刚产出、还没进任何容器的中间材料，
+     * 优先于存储取料被使用；这份配方没用完的会在结尾退回玩家背包，不会凭空消失。
+     */
+    private int placeRecipeIntoGrid(ServerPlayer player, CraftingRecipe recipe, boolean placeAll,
+                                    List<ItemStack> preloaded) {
         if (this.bench == null) {
             return 0;
         }
@@ -683,6 +712,12 @@ public class SmartWorkbenchMenu extends CraftingMenu {
                 while (target.getCount() < targetCount) {
                     int need = targetCount - target.getCount();
                     TrackedStack reused = takeMatching(existing, ingredient, Math.min(need, 1));
+                    if (reused == null && preloaded != null) {
+                        ItemStack crafted = takeFromStacks(preloaded, ingredient);
+                        if (!crafted.isEmpty()) {
+                            reused = new TrackedStack(crafted, null);
+                        }
+                    }
                     if (reused == null) {
                         int candidate = pool.find(ingredient);
                         if (candidate < 0) {
@@ -732,7 +767,33 @@ public class SmartWorkbenchMenu extends CraftingMenu {
                 player.drop(rest, false);
             }
         }
+        // 4) 链式补做出来、这份配方没用完的中间产物退回玩家，避免凭空消失。
+        if (preloaded != null) {
+            for (ItemStack leftover : preloaded) {
+                if (!leftover.isEmpty() && !player.getInventory().add(leftover)) {
+                    player.drop(leftover, false);
+                }
+            }
+            preloaded.clear();
+        }
         return pulled;
+    }
+
+    /** 从链式补做得到的中间产物里拿出一件符合材料条件的物品。 */
+    private static ItemStack takeFromStacks(List<ItemStack> stacks, Ingredient ingredient) {
+        for (int i = 0; i < stacks.size(); i++) {
+            ItemStack stack = stacks.get(i);
+            if (!ingredient.test(stack)) {
+                continue;
+            }
+            ItemStack result = stack.copyWithCount(1);
+            stack.shrink(1);
+            if (stack.isEmpty()) {
+                stacks.remove(i);
+            }
+            return result;
+        }
+        return ItemStack.EMPTY;
     }
 
     private record TrackedStack(ItemStack stack, StoragePool.Source source) {
@@ -1083,7 +1144,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             if (!acceptAction(serverPlayer)) {
                 return false;
             }
-            batchCraftFromGrid(serverPlayer);
+            batchCraftFromGrid(serverPlayer, 0);
             return true;
         }
         return false;
@@ -1096,8 +1157,14 @@ public class SmartWorkbenchMenu extends CraftingMenu {
      *              false = 普通点击：把材料配到合成格（不需要的材料退回背包）
      * @param batch true = Ctrl 点击：反复合成，直到材料不够或背包塞不下
      */
-    public void onRecipeListClick(ServerPlayer player, ResourceLocation recipeId, boolean craft, boolean batch) {
+    public void onRecipeListClick(ServerPlayer player, ResourceLocation recipeId, boolean craft, boolean batch,
+                                  int batchCount) {
         if (!acceptAction(player)) {
+            return;
+        }
+        if (batch && recipeId == null) {
+            this.activeFeedback = new CraftFeedback();
+            batchCraftFromGrid(player, batchCount);
             return;
         }
         this.activeFeedback = new CraftFeedback();
@@ -1106,7 +1173,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             // 避免同一批材料同时出现在合成格和存储快照里。
             returnMatrixMaterials(player);
             if (batch) {
-                batchCraftFromStorage(player, recipeId);
+                batchCraftFromStorage(player, recipeId, batchCount);
             } else {
                 craftFromStorage(player, recipeId);
             }
@@ -1135,7 +1202,12 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         // 预检要算上合成格里已有的料：placeRecipeIntoGrid 本来就会优先复用格子里现成的材料，
         // 预检却只看箱子和背包的话，会出现"明明够、报缺料"的对不上账。
         StoragePool availablePool = StoragePool.collect(scanHandlers());
-        if (!hasAllIngredients(crafting, availablePool)) {
+        boolean ingredientsAvailable = hasAllIngredients(crafting, availablePool);
+        if (!ingredientsAvailable && this.autoRefillEnabled) {
+            pullChainFromStorage(player, crafting);
+            return;
+        }
+        if (!ingredientsAvailable) {
             notify(player, "附近存储和背包材料不足", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
             refreshCraftables(true);
             return;
@@ -1219,10 +1291,12 @@ public class SmartWorkbenchMenu extends CraftingMenu {
 
         List<CraftableEntry> next = new ArrayList<>();
         if (!pool.isEmpty()) {
-            // 上限只用来兜住极端整合包（比如把整座仓库都塞满的创造模式测试），
-            // 正常情况下列表是全的——以前 1024 的默认上限会把后面的配方直接截掉，
-            // 玩家搜「樱花木活板门」这类排在后面的东西就会一无所获。
+            // 上限只用来兜住极端整合包；正常情况下直接项和链式项都会尽量列全。
             int max = ModConfig.maxListSize();
+            Set<ResourceLocation> directIds = new HashSet<>();
+            // 直接项做出来的是什么，也要喂给链式闭包：像「钻石块 -> 9 钻石 -> 钻石剑」，
+            // 中间那步本身是直接项，产物不进可达集合的话，后续链子就断了。
+            Set<Item> directOutputs = new HashSet<>();
             for (CraftingRecipe recipe : recipes) {
                 if (next.size() >= max) {
                     break;
@@ -1236,24 +1310,137 @@ public class SmartWorkbenchMenu extends CraftingMenu {
                         break;
                     }
                 }
-                // 右侧列表只显示一次合成所需材料全部充足的配方。
-                // 缺少基础材料时，即使缺少的中间物品可以递归合成，也不能把它伪装成可直接合成，
-                // 否则玩家点击后才发现缺料，甚至会误以为材料被凭空消耗。
                 boolean direct = possible && pool.plan(ingredients) != null;
                 if (!direct) {
                     continue;
                 }
                 ItemStack result = recipe.getResultItem(this.level.registryAccess());
                 if (!result.isEmpty()) {
-                    next.add(new CraftableEntry(recipe.getId(), result.copy()));
+                    next.add(new CraftableEntry(recipe.getId(), result.copy(), false));
+                    directIds.add(recipe.getId());
+                    directOutputs.add(result.getItem());
                 }
             }
+            next.sort(Comparator.comparing(entry -> entry.result().getItem().getDescriptionId()));
+            next.addAll(collectChainEntries(pool, directIds, directOutputs, max - next.size()));
         }
-        next.sort(Comparator.comparing(entry -> entry.result().getItem().getDescriptionId()));
         this.craftables = next;
         if (this.player instanceof ServerPlayer serverPlayer) {
             sendCraftableList(serverPlayer, next, storageSnapshot, storages.size(), getOutputCount());
         }
+    }
+
+    /**
+     * 链式可达扫描（问题 1）：从库存里已有的<b>物品种类</b>出发做闭包——
+     * 一份配方只要它每种材料都「有某个种类的实例可达」，就算点亮，
+     * 它的产物种类也加入可达集合，反复直到没有新增。被点亮、又不在直接列表里的
+     * 配方就是「链」项：材料种类齐了，但具体数量够不够这一步不算。
+     * <p>
+     * 数量够不够交给 {@link #createChainChecker} 在闭包结束后复核一遍：
+     * 逐条做数量级递归规划在几万配方的整合包里太贵，所以那份复核带节点预算，
+     * 算不完就保留（见该方法说明）。点击时服务端还会再用 {@code planRecipe}
+     * 精确规划一次，真缺基础材料会如实提示，不会凭空产出或吞材料。
+     * <p>
+     * {@code directOutputs} 是「直接可合成配方」的产物种类，也必须算进初始可达集合。
+     * 否则像「钻石块 -> 9 钻石 -> 钻石剑」这种链会断：中间那步「钻石块 -> 钻石」是
+     * 直接项，钻石从没被标记成可达，于是所有钻石工具/装备都点不亮。
+     * <p>
+     * 复杂度：每条配方最多被它「已可达的材料种类数」触发重查，配合
+     * {@link #getRecipesUsingItem()} 的反向索引，一次扫描在毫秒级；
+     * 数量复核额外受配置的总预算约束。
+     */
+    private List<CraftableEntry> collectChainEntries(StoragePool pool, Set<ResourceLocation> directIds,
+                                                     Set<Item> directOutputs, int budget) {
+        if (budget <= 0 || !ModConfig.showChainCraftables() || pool.isEmpty()) {
+            return List.of();
+        }
+        Map<net.minecraft.world.item.Item, List<CraftingRecipe>> using = getRecipesUsingItem();
+        Set<Item> reachable = pool.distinctItems();
+        reachable.addAll(directOutputs);
+        Map<ResourceLocation, CraftingRecipe> chainResults = new LinkedHashMap<>();
+        Deque<Item> queue = new ArrayDeque<>(reachable);
+        while (!queue.isEmpty()) {
+            Item item = queue.poll();
+            for (CraftingRecipe recipe : using.getOrDefault(item, List.of())) {
+                ResourceLocation id = recipe.getId();
+                if (id == null || directIds.contains(id) || chainResults.containsKey(id)) {
+                    continue;
+                }
+                boolean ok = true;
+                for (Ingredient ingredient : recipe.getIngredients()) {
+                    if (ingredient.isEmpty()) {
+                        continue;
+                    }
+                    if (!hasReachableType(ingredient, reachable)) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (!ok) {
+                    continue;
+                }
+                ItemStack result = recipe.getResultItem(this.level.registryAccess());
+                if (result.isEmpty()) {
+                    continue;
+                }
+                chainResults.put(id, recipe);
+                if (reachable.add(result.getItem())) {
+                    queue.add(result.getItem());
+                }
+            }
+        }
+        if (chainResults.isEmpty()) {
+            return List.of();
+        }
+        // 数量级复核（见 createChainChecker 的说明）。预算 0 表示不做复核，退回旧行为。
+        ChainFeasibility checker = createChainChecker(pool);
+        List<CraftableEntry> out = new ArrayList<>(chainResults.size());
+        for (Map.Entry<ResourceLocation, CraftingRecipe> entry : chainResults.entrySet()) {
+            CraftingRecipe recipe = entry.getValue();
+            if (checker != null && !checker.isExhausted()
+                    && checker.check(recipe) == ChainFeasibility.Verdict.IMPOSSIBLE) {
+                continue;
+            }
+            ItemStack result = recipe.getResultItem(this.level.registryAccess());
+            if (!result.isEmpty()) {
+                out.add(new CraftableEntry(entry.getKey(), result.copy(), true));
+            }
+        }
+        out.sort(Comparator.comparing(entry -> entry.result().getItem().getDescriptionId()));
+        return out.size() > budget ? new ArrayList<>(out.subList(0, budget)) : out;
+    }
+
+    /**
+     * 建一个链式列表的「数量级复核器」。
+     * <p>
+     * 类型闭包只看「有没有这种材料」，不看够不够：铁砧＝3 铁块＋4 铁锭，库里只有
+     * 8 铁锭＋173 铁粒（≈27 个铁锭），类型上铁块、铁锭都「有」，于是铁砧被列出来，
+     * 点下去却弹「缺少基础材料：铁锭x2」——这正是玩家报的假阳性。
+     * <p>
+     * 复核用和点击时同一套递归规划按真实数量复算，做不出来的链式项不列，
+     * 列表里出现的每一项都能真的点出来。单个候选的预算取总预算和 20000 的较小值，
+     * 免得一个又深又绕的候选把整轮预算吃光；预算用尽后停止复核、保留剩余项
+     * （宁可多留一项也不误删）。配置里把 chainVerifyBudget 填 0 则完全关闭复核。
+     */
+    private ChainFeasibility createChainChecker(StoragePool pool) {
+        int totalBudget = ModConfig.chainVerifyBudget();
+        if (totalBudget <= 0) {
+            return null;
+        }
+        int perCandidate = Math.max(2_000, Math.min(totalBudget, 20_000));
+        return new ChainFeasibility(pool.snapshotStacks(), getRecipesByResult(),
+                this.level.registryAccess(), ModConfig.recursiveMaxDepth(), ModConfig.recursiveMaxSteps(),
+                perCandidate, totalBudget);
+    }
+
+    /** 这份材料的任意一种可选物品在可达种类集合里吗（只看种类，不看数量和 NBT）。 */
+    private static boolean hasReachableType(Ingredient ingredient, Set<Item> reachable) {
+        for (ItemStack preview : ingredient.getItems()) {
+            if (reachable.contains(preview.getItem())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -1385,6 +1572,78 @@ public class SmartWorkbenchMenu extends CraftingMenu {
 
     /* 从附近存储取料 */
 
+    /**
+     * 链式取料：先把当前格子清空退回原来源，再做出目标配方的中间材料，
+     * 最后把目标配方完整摆回格子。这里只做 steps 的前 n-1 步，最后目标本身留给格子。
+     */
+    private void pullChainFromStorage(ServerPlayer player, CraftingRecipe recipe) {
+        returnMatrixMaterials(player);
+        this.bench.refreshStorages(true);
+        StoragePool pool = StoragePool.collect(inputHandlers());
+        RecursivePlanState state = new RecursivePlanState(pool.snapshotStacks());
+        if (!planTopLevel(recipe, state) || state.steps.isEmpty()
+                || !state.unavailable.isEmpty()) {
+            if (this.planAborted) {
+                notifyPlanAborted(player);
+            } else if (!state.unavailable.isEmpty()) {
+                notifyMissing(player, RecursivePlanState.copyStacks(state.unavailable),
+                        "gui." + SmartWorkbenchMod.MOD_ID + ".msg.missing_base");
+            } else {
+                notify(player, "附近存储和背包材料不足", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
+            }
+            markDirty();
+            updateResult();
+            this.matrixSignature = matrixSignature();
+            refreshCraftables(false);
+            return;
+        }
+        List<CraftingRecipe> intermediates = new ArrayList<>(state.steps.subList(0, Math.max(0, state.steps.size() - 1)));
+        List<ItemStack> handoff = new ArrayList<>();
+        if (!intermediates.isEmpty()) {
+            this.activeFeedback = null;
+            int outcome = executeRecursivePlan(player, intermediates, pool, false, handoff);
+            if (outcome != CRAFT_OK) {
+                returnHandoff(player, handoff);
+                markDirty();
+                updateResult();
+                this.matrixSignature = matrixSignature();
+                refreshCraftables(false);
+                return;
+            }
+        }
+        placeRecipeIntoGrid(player, recipe, false, handoff);
+        markDirty();
+        rememberSelection(player, recipe);
+        updateResult();
+        // 链式补做后复核一次：规划到执行之间材料可能被别的操作动过，摆不满要如实提示。
+        ForgeHooks.setCraftingPlayer(player);
+        boolean matched;
+        try {
+            matched = recipe.matches(this.matrix, this.level);
+        } finally {
+            ForgeHooks.setCraftingPlayer(null);
+        }
+        if (!matched) {
+            clearStickyRecipe();
+            notify(player, "材料已经变化，链式补做未完成，请重新点击",
+                    "gui." + SmartWorkbenchMod.MOD_ID + ".msg.recursive_changed");
+        } else {
+            beginStickyRecipe(player, recipe, false);
+        }
+        this.matrixSignature = matrixSignature();
+        refreshCraftables(false);
+    }
+
+    /** 把链式补做得到、最终没用上的中间产物退回玩家背包，塞不下就掉在脚下。 */
+    private static void returnHandoff(ServerPlayer player, List<ItemStack> handoff) {
+        for (ItemStack stack : handoff) {
+            if (!stack.isEmpty() && !player.getInventory().add(stack)) {
+                player.drop(stack, false);
+            }
+        }
+        handoff.clear();
+    }
+
     /** 点一下列表：把材料从附近存储配到合成格；格子里不符合配方的料退回背包。 */
     private void pullFromStorage(ServerPlayer player, ResourceLocation recipeId) {
         CraftingRecipe recipe = resolveEntry(recipeId);
@@ -1394,6 +1653,12 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             return;
         }
         if (this.bench == null) {
+            return;
+        }
+        this.bench.refreshStorages(true);
+        if (this.autoRefillEnabled
+                && !hasAllIngredients(recipe, StoragePool.collect(scanHandlers()))) {
+            pullChainFromStorage(player, recipe);
             return;
         }
         placeRecipeIntoGrid(player, recipe, false);
@@ -1411,12 +1676,53 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         }
         if (!matches) {
             clearStickyRecipe();
+            if (this.autoRefillEnabled) {
+                // 预检把合成格里的料也算进去了，退回后可能反而不够：交给链式补做再试一次
+                pullChainFromStorage(player, recipe);
+                return;
+            }
             notify(player, "附近存储和背包材料不足，缺少的中间材料可由其他配方合成",
                     "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
         } else {
             // 普通点击列表 = 明确选了这份配方，和 REI 加号一样享受「合成后自动补料」
             beginStickyRecipe(player, recipe, false);
         }
+    }
+
+    /** 数量框对应的批量次数；配置打开时保留旧行为，直到材料耗尽或达到安全上限。 */
+    private static int resolveBatchLimit(int requested) {
+        if (ModConfig.batchUseAllMaterials() || requested <= 0) {
+            return MAX_BATCH_CRAFTS;
+        }
+        return Math.min(MAX_BATCH_CRAFTS, Math.max(1, requested));
+    }
+
+    /**
+     * 精确执行一轮链式合成。规划失败时只在调用方要求时提示，避免批量循环每轮重复弹消息。
+     */
+    private int chainCraftOnce(ServerPlayer player, CraftingRecipe recipe, boolean toOutput,
+                               boolean notifyOnFail) {
+        if (this.bench == null) {
+            return CRAFT_MISSING;
+        }
+        this.bench.refreshStorages(true);
+        StoragePool pool = StoragePool.collect(inputHandlers());
+        RecursivePlanState state = new RecursivePlanState(pool.snapshotStacks());
+        if (!planTopLevel(recipe, state) || state.steps.isEmpty()
+                || !state.unavailable.isEmpty() || state.autoCraftable.isEmpty()) {
+            if (notifyOnFail) {
+                if (this.planAborted) {
+                    notifyPlanAborted(player);
+                } else if (!state.unavailable.isEmpty()) {
+                    notifyMissing(player, RecursivePlanState.copyStacks(state.unavailable),
+                            "gui." + SmartWorkbenchMod.MOD_ID + ".msg.missing_base");
+                } else {
+                    notify(player, "附近存储和背包材料不足", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
+                }
+            }
+            return CRAFT_MISSING;
+        }
+        return executeRecursivePlan(player, state.steps, pool, toOutput);
     }
 
     /** shift 点列表：直接从存储取材合成一次，产物进背包，不占用合成格。 */
@@ -1433,11 +1739,13 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         this.bench.refreshStorages(true);
         StoragePool pool = StoragePool.collect(inputHandlers());
         int outcome = craftOnce(player, recipe, pool, false);
+        if (outcome == CRAFT_MISSING && this.autoRefillEnabled) {
+            outcome = chainCraftOnce(player, recipe, false, true);
+        }
         if (outcome == CRAFT_OK) {
             notifyFeedback(player, 1);
-        } else if (outcome == CRAFT_MISSING) {
-            // Shift 点击只允许消耗真实存在的材料（接入存储 + 玩家背包），不能把合成格中的材料
-            // 或递归配方当成额外库存，否则部分材料会被重复计算。
+        } else if (outcome == CRAFT_MISSING && !this.autoRefillEnabled) {
+            // 关闭自动补齐时保持旧行为：只使用现成的直接材料。
             notify(player, "附近存储和背包材料不足，缺少的中间材料可由其他配方合成",
                     "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
         } else if (outcome == CRAFT_UNSUPPORTED) {
@@ -1456,7 +1764,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
      * Ctrl 点列表：反复取材合成，直到材料不够、背包塞不下或到单次上限。
      * 每轮都重新读一遍库存，因为上一轮真的从箱子里把材料抽走了。
      */
-    private void batchCraftFromStorage(ServerPlayer player, ResourceLocation recipeId) {
+    private void batchCraftFromStorage(ServerPlayer player, ResourceLocation recipeId, int requestedCount) {
         CraftingRecipe recipe = resolveEntry(recipeId);
         if (recipe == null) {
             notify(player, "配方已失效，列表已刷新", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.recipe_gone");
@@ -1469,7 +1777,8 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         this.bench.refreshStorages(true);
         int crafted = 0;
         int outcome = CRAFT_OK;
-        for (int guard = 0; guard < MAX_BATCH_CRAFTS; guard++) {
+        int limit = resolveBatchLimit(requestedCount);
+        for (int guard = 0; guard < limit; guard++) {
             StoragePool pool = StoragePool.collect(inputHandlers());
             if (pool.isEmpty()) {
                 outcome = CRAFT_MISSING;
@@ -1478,8 +1787,10 @@ public class SmartWorkbenchMenu extends CraftingMenu {
                 }
                 break;
             }
-            // 只有第一次失败时才提示，中途没料了是正常结束
-            outcome = craftOnce(player, recipe, pool, crafted == 0);
+            outcome = craftOnce(player, recipe, pool, crafted == 0 && !this.autoRefillEnabled);
+            if (outcome == CRAFT_MISSING && this.autoRefillEnabled) {
+                outcome = chainCraftOnce(player, recipe, false, crafted == 0);
+            }
             if (outcome != CRAFT_OK) {
                 break;
             }
@@ -1501,7 +1812,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
      * 格子里现成的料会先退回（来源记录的回原容器，手动放的回背包），再和
      * 接入存储、背包一起按「整份库存」反复取材，产物进背包。
      */
-    private void batchCraftFromGrid(ServerPlayer player) {
+    private void batchCraftFromGrid(ServerPlayer player, int requestedCount) {
         if (this.bench == null) {
             return;
         }
@@ -1522,7 +1833,8 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         returnMatrixMaterials(player);
         this.bench.refreshStorages(true);
         int crafted = 0;
-        for (int guard = 0; guard < MAX_BATCH_CRAFTS; guard++) {
+        int limit = resolveBatchLimit(requestedCount);
+        for (int guard = 0; guard < limit; guard++) {
             StoragePool pool = StoragePool.collect(inputHandlers());
             if (pool.isEmpty()) {
                 if (crafted == 0) {
@@ -1531,7 +1843,10 @@ public class SmartWorkbenchMenu extends CraftingMenu {
                 break;
             }
             // 只有第一次失败时才提示，中途没料了是正常结束
-            int outcome = craftOnce(player, recipe, pool, crafted == 0);
+            int outcome = craftOnce(player, recipe, pool, crafted == 0 && !this.autoRefillEnabled);
+            if (outcome == CRAFT_MISSING && this.autoRefillEnabled) {
+                outcome = chainCraftOnce(player, recipe, false, crafted == 0);
+            }
             if (outcome != CRAFT_OK) {
                 break;
             }
@@ -1560,6 +1875,24 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         if (!acceptAction(player)) {
             return;
         }
+        runAutoCraftFromStorage(player, recipeId);
+    }
+
+    /** 产物格 Alt+左键入口：服务端以当前真正匹配的配方为准，避免客户端伪造配方 ID。 */
+    public void autoCraftFromGrid(ServerPlayer player) {
+        if (!acceptAction(player)) {
+            return;
+        }
+        updateResult();
+        CraftingRecipe recipe = this.lastGridRecipe;
+        if (recipe == null || recipe.getId() == null || this.resultSlots.getItem(0).isEmpty()) {
+            notify(player, "合成格里还没有能合成的配方", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.grid_empty");
+            return;
+        }
+        runAutoCraftFromStorage(player, recipe.getId());
+    }
+
+    private void runAutoCraftFromStorage(ServerPlayer player, ResourceLocation recipeId) {
         if (this.level.isClientSide || this.bench == null) {
             return;
         }
@@ -1575,6 +1908,9 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         int crafted = 0;
         int outcome = CRAFT_OK;
         List<ItemStack> missing = List.of();
+        // 预算中止要就地记下来：这个循环可能因为背包/输出容器而提前退出，
+        // 一次都没走到规划那一步，直接读 planAborted 会读到上一次操作留下的旧值。
+        boolean planAborted = false;
         this.activeFeedback = new CraftFeedback();
         // 自动合成完全独立于合成格，先归还当前格子，防止把同一份材料重复算入库存。
         returnMatrixMaterials(player);
@@ -1597,14 +1933,16 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             // 直接材料不够：重新读一遍库存，规划整棵依赖树，能补齐就补一次
             StoragePool planPool = StoragePool.collect(inputHandlers());
             RecursivePlanState state = new RecursivePlanState(planPool.snapshotStacks());
-            if (!planRecipe(recipe, state, 0, new HashSet<>()) || state.steps.isEmpty()
+            if (!planTopLevel(recipe, state) || state.steps.isEmpty()
                     || !state.unavailable.isEmpty() || state.autoCraftable.isEmpty()) {
                 missing = RecursivePlanState.copyStacks(state.unavailable);
+                planAborted = this.planAborted;
                 outcome = CRAFT_MISSING;
                 break;
             }
             int recursive = executeRecursivePlan(player, state.steps, planPool, true);
-            if (recursive == CRAFT_OK) {
+            if (recursive == CRAFT_OK || recursive == CRAFT_OUTPUT_FULL) {
+                // 输出容器满时产物已退回背包，这次合成仍然算数
                 crafted++;
                 continue;
             }
@@ -1620,6 +1958,8 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         } else if (outcome == CRAFT_UNSUPPORTED) {
             notify(player, "这个配方不支持一键合成，请点图标取料到合成格",
                     "gui." + SmartWorkbenchMod.MOD_ID + ".msg.unsupported");
+        } else if (planAborted) {
+            notifyPlanAborted(player);
         } else if (!missing.isEmpty()) {
             notifyMissing(player, missing, "gui." + SmartWorkbenchMod.MOD_ID + ".msg.missing_base");
         } else {
@@ -1643,8 +1983,10 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         this.bench.refreshStorages(true);
         StoragePool pool = StoragePool.collect(inputHandlers());
         RecursivePlanState state = new RecursivePlanState(pool.snapshotStacks());
-        if (!planRecipe(target, state, 0, new HashSet<>()) || state.steps.isEmpty()) {
-            if (!state.unavailable.isEmpty()) {
+        if (!planTopLevel(target, state) || state.steps.isEmpty()) {
+            if (this.planAborted) {
+                notifyPlanAborted(player);
+            } else if (!state.unavailable.isEmpty()) {
                 notifyMissing(player, state.unavailable, "gui." + SmartWorkbenchMod.MOD_ID + ".msg.missing_base");
             } else {
                 notify(player, "附近存储和背包材料不足", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
@@ -1686,9 +2028,11 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         this.bench.refreshStorages(true);
         StoragePool pool = StoragePool.collect(inputHandlers());
         RecursivePlanState state = new RecursivePlanState(pool.snapshotStacks());
-        if (!planRecipe(target, state, 0, new HashSet<>()) || !state.unavailable.isEmpty()
+        if (!planTopLevel(target, state) || !state.unavailable.isEmpty()
                 || state.autoCraftable.isEmpty()) {
-            if (!state.unavailable.isEmpty()) {
+            if (this.planAborted) {
+                notifyPlanAborted(player);
+            } else if (!state.unavailable.isEmpty()) {
                 notifyMissing(player, state.unavailable, "gui." + SmartWorkbenchMod.MOD_ID + ".msg.missing_base");
             } else {
                 notify(player, "材料已经变化，请重新点击合成", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.recursive_changed");
@@ -1705,9 +2049,28 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         refreshCraftables(false);
     }
 
+    /**
+     * 顶层规划：先重置本次操作的搜索预算，再递归规划。
+     * <p>
+     * 只有顶层入口走这里，{@link #planRecipe} 之间的递归调用共享同一份预算，
+     * 否则预算会在每一层被重新填满，形同虚设。
+     */
+    private boolean planTopLevel(CraftingRecipe target, RecursivePlanState state) {
+        this.planNodes = 0;
+        this.planAborted = false;
+        return planRecipe(target, state, 0, new HashSet<>());
+    }
+
     /** 递归规划一份配方；steps 按依赖先后排列，最后一项是目标物品。 */
     private boolean planRecipe(CraftingRecipe recipe, RecursivePlanState state, int depth, Set<ResourceLocation> active) {
-        if (depth > MAX_RECURSIVE_DEPTH || state.steps.size() >= MAX_RECURSIVE_STEPS
+        if (this.planAborted) {
+            return false;
+        }
+        if (++this.planNodes > ModConfig.recursiveNodeBudget()) {
+            this.planAborted = true;
+            return false;
+        }
+        if (depth > ModConfig.recursiveMaxDepth() || state.steps.size() >= ModConfig.recursiveMaxSteps()
                 || recipe == null || !isPlainCraft(recipe)) {
             return false;
         }
@@ -1805,6 +2168,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         if (this.plainRecipes == null || version != this.recipeIndexVersion) {
             List<CraftingRecipe> recipes = new ArrayList<>();
             Map<net.minecraft.world.item.Item, List<CraftingRecipe>> byResult = new HashMap<>();
+            Map<net.minecraft.world.item.Item, List<CraftingRecipe>> usingItem = new HashMap<>();
             for (CraftingRecipe recipe : this.level.getRecipeManager().getAllRecipesFor(RecipeType.CRAFTING)) {
                 if (!isPlainCraft(recipe)) {
                     continue;
@@ -1814,12 +2178,29 @@ public class SmartWorkbenchMenu extends CraftingMenu {
                 if (!result.isEmpty()) {
                     byResult.computeIfAbsent(result.getItem(), ignored -> new ArrayList<>()).add(recipe);
                 }
+                // 材料种类 → 用到它的配方：链式可达性扫描沿「新点亮的种类」找候选配方，
+                // 不用每点亮一种就把全部配方重扫一遍。同一份配方只登记一次。
+                Set<net.minecraft.world.item.Item> touched = new HashSet<>();
+                for (Ingredient ingredient : recipe.getIngredients()) {
+                    for (ItemStack preview : ingredient.getItems()) {
+                        touched.add(preview.getItem());
+                    }
+                }
+                for (net.minecraft.world.item.Item used : touched) {
+                    usingItem.computeIfAbsent(used, ignored -> new ArrayList<>()).add(recipe);
+                }
             }
             this.plainRecipes = List.copyOf(recipes);
             this.recipesByResult = byResult;
+            this.recipesUsingItem = usingItem;
             this.recipeIndexVersion = version;
         }
         return this.plainRecipes;
+    }
+
+    private Map<net.minecraft.world.item.Item, List<CraftingRecipe>> getRecipesUsingItem() {
+        getPlainRecipes();
+        return this.recipesUsingItem;
     }
 
     private Map<net.minecraft.world.item.Item, List<CraftingRecipe>> getRecipesByResult() {
@@ -1903,6 +2284,16 @@ public class SmartWorkbenchMenu extends CraftingMenu {
      */
     private int executeRecursivePlan(ServerPlayer player, List<CraftingRecipe> steps, StoragePool pool,
                                      boolean toOutput) {
+        return executeRecursivePlan(player, steps, pool, toOutput, null);
+    }
+
+    /**
+     * 带中转清单的执行：{@code handoff} 不为 null 时，中间产物不塞给玩家，而是收进这份清单，
+     * 由调用方直接接着用（例如紧接着摆进合成格）。这样链式补做就不必依赖「先进背包、
+     * 再从背包捞出来」，背包塞满、同类堆叠合并都不会再让中间产物半路掉在脚下。
+     */
+    private int executeRecursivePlan(ServerPlayer player, List<CraftingRecipe> steps, StoragePool pool,
+                                     boolean toOutput, List<ItemStack> handoff) {
         List<ItemStack> generated = new ArrayList<>();
         List<ItemStack> pulled = new ArrayList<>();
         List<Integer> pulledFrom = new ArrayList<>();
@@ -1948,7 +2339,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
                         result.onCraftedBy(this.level, player, result.getCount());
                         ForgeEventFactory.firePlayerCraftingEvent(player, result, grid);
                         player.awardRecipes(List.<Recipe<?>>of(recipe));
-                        if (index == steps.size() - 1) {
+                        if (index == steps.size() - 1 && handoff == null) {
                             delivery = deliverResult(player, result, toOutput);
                             if (this.activeFeedback != null) {
                                 this.activeFeedback.addResult(result);
@@ -1975,6 +2366,15 @@ public class SmartWorkbenchMenu extends CraftingMenu {
                 notify(player, "材料已经变化，自动合成已停止", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.recursive_changed");
                 return CRAFT_MISSING;
             }
+        }
+        if (handoff != null) {
+            // 中间产物整批交给调用方（例如随后直接摆进合成格），不再经玩家背包中转
+            for (ItemStack stack : generated) {
+                if (!stack.isEmpty()) {
+                    handoff.add(stack);
+                }
+            }
+            return delivery;
         }
         for (ItemStack stack : generated) {
             if (!stack.isEmpty() && !player.getInventory().add(stack)) {
@@ -2208,6 +2608,17 @@ public class SmartWorkbenchMenu extends CraftingMenu {
 
     private void notify(Player player, String fallback, String key) {
         player.displayClientMessage(Component.translatableWithFallback(key, fallback), true);
+    }
+
+    /**
+     * 规划因搜索预算用尽而中止时的提示。
+     * <p>
+     * 和「材料不足」要分清楚：这次是没算完，不代表真的做不出来。
+     * 提示里直接点出配置项，玩家遇到超大配方树时知道去哪里调。
+     */
+    private void notifyPlanAborted(Player player) {
+        notify(player, "链式合成太复杂，已停止（可调大配置 craft.recursiveNodeBudget）",
+                "gui." + SmartWorkbenchMod.MOD_ID + ".msg.recursive_too_complex");
     }
 
     /** 带数字的提示（批量合成做了多少个之类）。 */

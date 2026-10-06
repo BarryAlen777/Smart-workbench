@@ -7,8 +7,6 @@ version="${mod_version}"
 displayName="${mod_name}"
 authors="BarryAlen777"
 credits="BarryAlen777"
-description='''智能工作台 Smart Workbench
-开源地址 Source: https://github.com/BarryAlen777/Smart-workbench'''
 logoFile="logo.png"
 displayURL="https://github.com/BarryAlen777/Smart-workbench"
 [[dependencies.${mod_id}]]
@@ -23,8 +21,6 @@ mandatory=true
 versionRange="[${minecraft_version}]"
 ordering="NONE"
 side="BOTH"
-# 可选联动：装了「多态合成」(Polymorph) 时，产物格旁会多出它的配方选择按钮，
-# 我们算产物和取产物都会听它的选择；没装就是普通的原版行为，不影响加载。
 [[dependencies.${mod_id}]]
 modId="polymorph"
 mandatory=false

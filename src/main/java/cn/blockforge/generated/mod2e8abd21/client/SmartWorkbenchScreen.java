@@ -9,6 +9,7 @@ import cn.blockforge.generated.mod2e8abd21.compat.ReiTransferBridge;
 import cn.blockforge.generated.mod2e8abd21.gui.GuiLayout;
 import cn.blockforge.generated.mod2e8abd21.menu.CraftableEntry;
 import cn.blockforge.generated.mod2e8abd21.menu.SmartWorkbenchMenu;
+import cn.blockforge.generated.mod2e8abd21.network.C2SAutoCraftGridPacket;
 import cn.blockforge.generated.mod2e8abd21.network.C2SAutoCraftPacket;
 import cn.blockforge.generated.mod2e8abd21.network.C2SCraftRequestPacket;
 import com.mojang.blaze3d.platform.InputConstants;
@@ -105,6 +106,17 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
     private static final int HOVER_BG = 0x408A86B8;
     /** 选中项的描边色（金）。 */
     private static final int SELECT_COLOR = 0xFFE0A83C;
+    /** 链式可合成项的角标颜色。 */
+    private static final int CHAIN_COLOR = 0xFFB07CFF;
+    /**
+     * 「链」角标的缩放比例。
+     * <p>
+     * 1.0 是原版字号（约 8x8），压在 16x16 的图标上显得很挤；0.65 缩到约 5x6，
+     * 既不挡物品又还认得出是个「链」字。别调得比 0.5 更小，再小汉字就糊成一团了。
+     */
+    private static final float CHAIN_BADGE_SCALE = 0.65F;
+    private static final int BATCH_DEFAULT = 16;
+    private static final int BATCH_MAX = 1024;
     /** 同类折叠头的描边色（青），和选中的金色区分开。 */
     private static final int GROUP_COLOR = 0xFF4FC3F7;
     /** 折叠头角上的数量数字。 */
@@ -175,6 +187,8 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
 
     /** 搜索框：只负责过滤右侧列表，不参与网络协议。 */
     private EditBox searchBox;
+    /** 批量合成次数输入框：按批量合成键时，默认做 16 次。 */
+    private EditBox batchBox;
     /** 同类折叠开关，默认开（列表里同一种尾段的物品收成一项）。 */
     private boolean folding = true;
     /** 已经点开、正在展开显示成员的分类。 */
@@ -224,6 +238,18 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         this.searchBox.setHint(Component.empty());
         this.searchBox.setValue(previous);
         this.searchBox.setResponder(text -> this.displayDirty = true);
+
+        String previousBatch = this.batchBox == null ? "" : this.batchBox.getValue();
+        this.batchBox = new EditBox(this.font,
+                this.leftPos + GuiLayout.BATCH_INPUT_X, this.topPos + GuiLayout.BATCH_INPUT_Y,
+                GuiLayout.BATCH_INPUT_WIDTH, GuiLayout.BATCH_INPUT_HEIGHT,
+                label("gui." + SmartWorkbenchMod.MOD_ID + ".label.batch_count", "批量数量"));
+        this.batchBox.setMaxLength(4);
+        this.batchBox.setBordered(false);
+        this.batchBox.setTextColor(0xFFFFFFFF);
+        this.batchBox.setHint(Component.empty());
+        this.batchBox.setFilter(text -> text.matches("[0-9]*"));
+        this.batchBox.setValue(previousBatch.isEmpty() ? String.valueOf(BATCH_DEFAULT) : previousBatch);
         this.displayDirty = true;
         this.displaySource = null;
     }
@@ -235,6 +261,9 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         ensureRecipeViewerBridges();
         if (this.searchBox != null) {
             this.searchBox.tick();
+        }
+        if (this.batchBox != null) {
+            this.batchBox.tick();
         }
         ensureDisplay();
     }
@@ -285,6 +314,7 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
             drawSearchBoxFrame(graphics);
             this.searchBox.render(graphics, mouseX, mouseY, partialTick);
         }
+        drawBatchCountBox(graphics, mouseX, mouseY, partialTick);
 
         // 5x5 的配方图标
         int hovered = cellIndexAt(mouseX, mouseY);
@@ -308,6 +338,9 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
                 }
                 ItemStack result = cell.entry().result();
                 graphics.renderItem(result, x, y);
+                if (!cell.header() && cell.entry().chain()) {
+                    drawChainBadge(graphics, x, y);
+                }
                 if (cell.header()) {
                     drawGroupHeader(graphics, cell, x, y);
                 } else {
@@ -463,6 +496,45 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         }
     }
 
+    /** 画产物格下方的批量数量框和标签。 */
+    private void drawBatchCountBox(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
+        if (this.batchBox == null) {
+            return;
+        }
+        int x = this.leftPos + GuiLayout.BATCH_INPUT_X;
+        int y = this.topPos + GuiLayout.BATCH_INPUT_Y;
+        int w = GuiLayout.BATCH_INPUT_WIDTH;
+        int h = GuiLayout.BATCH_INPUT_HEIGHT;
+        int border = this.batchBox.isFocused() ? SELECT_COLOR : GuiLayout.LINE_SOFT_COLOR;
+        graphics.fill(x - 1, y - 1, x + w + 1, y + h + 1, border);
+        graphics.fill(x, y, x + w, y + h, SEARCH_BG);
+        graphics.drawString(this.font,
+                label("gui." + SmartWorkbenchMod.MOD_ID + ".label.batch_count", "批量数量"),
+                this.leftPos + GuiLayout.BATCH_LABEL_X, this.topPos + GuiLayout.BATCH_LABEL_Y, TEXT_MAIN, false);
+        this.batchBox.render(graphics, mouseX, mouseY, partialTick);
+    }
+
+    /**
+     * 链式项角标：提醒玩家这项需要先补做中间材料。
+     * <p>
+     * 角标按 {@link #CHAIN_BADGE_SCALE} 缩小后贴在格子右上角。早前是原尺寸的「链」字，
+     * 一个 8x8 的字压在 16x16 的图标上盖掉将近四分之一，玩家反馈「有点挡住物品」；
+     * 缩到 0.65 后只占 6x6，加上描边仍然认得出来，物品的轮廓基本完整。
+     * 放右上角是刻意的：右下角是原版的堆叠数量，两边不会打架。
+     */
+    private void drawChainBadge(GuiGraphics graphics, int x, int y) {
+        String mark = label("gui." + SmartWorkbenchMod.MOD_ID + ".badge.chain", "链").getString();
+        graphics.pose().pushPose();
+        graphics.pose().translate(0.0F, 0.0F, GROUP_CHIP_Z);
+        // 先按屏幕坐标把原点挪到角标左上角，再整体缩放——缩放后的字号是 w*scale，
+        // 所以要拿缩放后的宽度来算右对齐。
+        graphics.pose().translate(x + CELL - 2 - this.font.width(mark) * CHAIN_BADGE_SCALE, y,
+                0.0F);
+        graphics.pose().scale(CHAIN_BADGE_SCALE, CHAIN_BADGE_SCALE, 1.0F);
+        drawOutlinedChar(graphics, mark, 0, 0, CHAIN_COLOR);
+        graphics.pose().popPose();
+    }
+
     /**
      * 折叠头的额外装饰：青边 + 左上角 +/- 表示收起/展开 + 右下角这一类的成员数。
      * 图标沿用第一个成员，玩家一眼能看出这堆是什么东西。
@@ -512,7 +584,7 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
 
     @Override
     public boolean mouseClicked(double mouseX, double mouseY, int button) {
-        if (handleSearchBoxClick(mouseX, mouseY, button)) {
+        if (handleTextBoxClick(mouseX, mouseY, button)) {
             return true;
         }
         ensureDisplay();
@@ -528,8 +600,8 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         if (isHeldClickGesture(ModKeyMappings.BATCH_CRAFT, button)) {
             if (isPointInResultSlot(mouseX, mouseY)) {
                 playClickSound();
-                this.minecraft.gameMode.handleInventoryButtonClick(this.menu.containerId,
-                        SmartWorkbenchMenu.BUTTON_BATCH_GRID);
+                ModNetwork.sendToServer(new C2SCraftRequestPacket(this.menu.getBenchPos(),
+                        null, false, true, parseBatchCount()));
                 return true;
             }
             int batchIndex = cellIndexAt(mouseX, mouseY);
@@ -538,7 +610,7 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
                 this.selectedRecipe = cell.entry().recipeId();
                 playClickSound();
                 ModNetwork.sendToServer(new C2SCraftRequestPacket(this.menu.getBenchPos(),
-                        cell.entry().recipeId(), true, true));
+                        cell.entry().recipeId(), true, true, parseBatchCount()));
                 return true;
             }
         }
@@ -546,6 +618,10 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         // 折叠头不再响应自动合成键——上一版「全部展开」借用了同一个手势，玩家反馈撞键；
         // 现在 Alt+左键点折叠头就落回普通左键，只展开/收起被点的那一类。
         if (isAutoCraftGesture(button)) {
+            if (this.menu.getCarried().isEmpty() && isPointInResultSlot(mouseX, mouseY)) {
+                autoCraftGrid();
+                return true;
+            }
             int autoIndex = cellIndexAt(mouseX, mouseY);
             if (autoIndex >= 0) {
                 CraftableListView.Cell cell = this.display.get(autoIndex);
@@ -601,7 +677,7 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
                 this.selectedRecipe = cell.entry().recipeId();
                 playClickSound();
                 ModNetwork.sendToServer(new C2SCraftRequestPacket(this.menu.getBenchPos(), cell.entry().recipeId(),
-                        hasShiftDown(), false));
+                        hasShiftDown(), false, 0));
                 return true;
             }
         }
@@ -647,20 +723,29 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         return mapping.getTranslatedKeyMessage().getString();
     }
 
-    /** 点搜索框就聚焦并把光标放好；点别处就取消聚焦，免得打字一直被搜索框吃掉。 */
-    private boolean handleSearchBoxClick(double mouseX, double mouseY, int button) {
-        if (this.searchBox == null) {
-            return false;
-        }
-        if (isPointInSearchBox(mouseX, mouseY)) {
-            if (!this.searchBox.isFocused()) {
-                this.searchBox.setFocused(true);
+    /** 点搜索框或数量框就聚焦；点别处取消焦点，避免快捷键被输入框吃掉。 */
+    private boolean handleTextBoxClick(double mouseX, double mouseY, int button) {
+        boolean inSearch = this.searchBox != null && isPointInSearchBox(mouseX, mouseY);
+        boolean inBatch = this.batchBox != null && isPointInBatchBox(mouseX, mouseY);
+        if (inSearch || inBatch) {
+            if (this.searchBox != null) {
+                this.searchBox.setFocused(inSearch);
             }
-            this.searchBox.mouseClicked(mouseX, mouseY, button);
+            if (this.batchBox != null) {
+                this.batchBox.setFocused(inBatch);
+            }
+            if (inSearch) {
+                this.searchBox.mouseClicked(mouseX, mouseY, button);
+            } else {
+                this.batchBox.mouseClicked(mouseX, mouseY, button);
+            }
             return true;
         }
-        if (this.searchBox.isFocused()) {
+        if (this.searchBox != null) {
             this.searchBox.setFocused(false);
+        }
+        if (this.batchBox != null) {
+            this.batchBox.setFocused(false);
         }
         return false;
     }
@@ -731,18 +816,28 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         return modifier == KeyModifier.NONE || modifier.isActive(KeyConflictContext.GUI);
     }
 
-    /** 自动合成当前选中的配方；没选中就提示一句。 */
+    /** 自动合成当前选中的配方；没有选中时改用合成格当前配方。 */
     private void autoCraftSelected() {
         CraftableEntry entry = findSelected();
         if (entry == null) {
-            if (this.minecraft != null && this.minecraft.player != null) {
-                this.minecraft.player.displayClientMessage(
-                        label("gui." + SmartWorkbenchMod.MOD_ID + ".msg.select_first",
-                                "先在右侧列表里点一下要自动合成的物品"), true);
-            }
+            autoCraftGrid();
             return;
         }
         sendAutoCraft(entry);
+    }
+
+    private void autoCraftGrid() {
+        if (this.minecraft == null || this.minecraft.player == null
+                || !this.menu.getSlot(SmartWorkbenchMenu.SLOT_RESULT).hasItem()) {
+            if (this.minecraft != null && this.minecraft.player != null) {
+                this.minecraft.player.displayClientMessage(
+                        label("gui." + SmartWorkbenchMod.MOD_ID + ".msg.grid_empty",
+                                "合成格里还没有能合成的配方"), true);
+            }
+            return;
+        }
+        playClickSound();
+        ModNetwork.sendToServer(new C2SAutoCraftGridPacket(this.menu.getBenchPos()));
     }
 
     /** 按配方 id 在最新的可合成列表里找回选中项：列表被搜索/折叠/刷新后也找得回来。 */
@@ -767,15 +862,15 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
     public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
         // 搜索框聚焦时，键盘优先给搜索框：Esc/回车退出输入，其余按键一律吞掉，
         // 免得打字时误触刷新、自动合成快捷键，或者被 E 键把整个界面关掉。
-        if (this.searchBox != null && this.searchBox.isFocused()) {
+        EditBox focusedBox = this.searchBox != null && this.searchBox.isFocused() ? this.searchBox
+                : (this.batchBox != null && this.batchBox.isFocused() ? this.batchBox : null);
+        if (focusedBox != null) {
             if (keyCode == GLFW.GLFW_KEY_ESCAPE || keyCode == GLFW.GLFW_KEY_ENTER
                     || keyCode == GLFW.GLFW_KEY_KP_ENTER) {
-                this.searchBox.setFocused(false);
+                focusedBox.setFocused(false);
                 return true;
             }
-            if (this.searchBox.keyPressed(keyCode, scanCode, modifiers)) {
-                return true;
-            }
+            focusedBox.keyPressed(keyCode, scanCode, modifiers);
             return true;
         }
         // Ctrl+F 聚焦搜索框，像 REI 一样顺手
@@ -799,11 +894,12 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
 
     @Override
     public boolean charTyped(char codePoint, int modifiers) {
-        if (this.searchBox != null && this.searchBox.isFocused()
-                && this.searchBox.charTyped(codePoint, modifiers)) {
+        EditBox focusedBox = this.searchBox != null && this.searchBox.isFocused() ? this.searchBox
+                : (this.batchBox != null && this.batchBox.isFocused() ? this.batchBox : null);
+        if (focusedBox != null && focusedBox.charTyped(codePoint, modifiers)) {
             return true;
         }
-        return super.charTyped(codePoint, modifiers);
+        return focusedBox != null || super.charTyped(codePoint, modifiers);
     }
 
     @Override
@@ -885,7 +981,17 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
                                 "%s+点击：批量合成合成格里这份配方，直到材料用完（自己摆的料也算）", batchKey)
                         .withStyle(ChatFormatting.GRAY));
             }
+            lines.add(labelArgs("gui." + SmartWorkbenchMod.MOD_ID + ".tooltip.result_auto",
+                            "%s：自动合成合成格里的这份配方（缺料自动补齐，产物进输出容器）",
+                            fullKeybindText(ModKeyMappings.AUTO_CRAFT))
+                    .withStyle(ChatFormatting.GOLD));
             graphics.renderTooltip(this.font, lines, shown.getTooltipImage(), shown, mouseX, mouseY);
+        }
+        if (isPointInBatchBox(mouseX, mouseY)) {
+            graphics.renderTooltip(this.font,
+                    List.of(label("gui." + SmartWorkbenchMod.MOD_ID + ".tooltip.batch_box",
+                            "批量合成次数：批量点击时做这么多次；配置开启用完材料时会忽略这里")),
+                    Optional.empty(), mouseX, mouseY);
         }
         // 这个方法由上面 render 里的 this.renderTooltip(...) 调用（AbstractContainerScreen.render
         // 自己不调它，必须手动补一句）。两个按钮的说明仍然画在 render 末尾。
@@ -950,6 +1056,11 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
                             "这件产物有 %s 份配方，点哪一项就用哪一份", sameOutput))
                     .withStyle(ChatFormatting.AQUA));
         }
+        if (entry.chain()) {
+            lines.add(label("gui." + SmartWorkbenchMod.MOD_ID + ".tooltip.chain",
+                    "链式合成：缺的中间材料会先自动补做（需开启自动补齐）")
+                    .withStyle(ChatFormatting.LIGHT_PURPLE));
+        }
         lines.add(Component.empty());
         lines.add(label("gui." + SmartWorkbenchMod.MOD_ID + ".tooltip.click", "点击：自动配料到合成格")
                 .withStyle(ChatFormatting.YELLOW));
@@ -958,7 +1069,7 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         String batchKey = gestureKeyName(ModKeyMappings.BATCH_CRAFT);
         if (batchKey != null) {
             lines.add(labelArgs("gui." + SmartWorkbenchMod.MOD_ID + ".tooltip.ctrl",
-                    "%s+点击：批量合成，直到材料用完", batchKey)
+                    "%s+点击：批量合成，次数取自产物格下方的批量数量框", batchKey)
                     .withStyle(ChatFormatting.YELLOW));
         }
         lines.add(labelArgs("gui." + SmartWorkbenchMod.MOD_ID + ".tooltip.auto",
@@ -1082,6 +1193,25 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         int x = this.leftPos + SEARCH_X;
         int y = this.topPos + SEARCH_Y;
         return mouseX >= x && mouseX < x + SEARCH_W && mouseY >= y && mouseY < y + SEARCH_H;
+    }
+
+    private boolean isPointInBatchBox(double mouseX, double mouseY) {
+        int x = this.leftPos + GuiLayout.BATCH_INPUT_X;
+        int y = this.topPos + GuiLayout.BATCH_INPUT_Y;
+        return mouseX >= x && mouseX < x + GuiLayout.BATCH_INPUT_WIDTH
+                && mouseY >= y && mouseY < y + GuiLayout.BATCH_INPUT_HEIGHT;
+    }
+
+    private int parseBatchCount() {
+        if (this.batchBox == null) {
+            return BATCH_DEFAULT;
+        }
+        try {
+            int value = Integer.parseInt(this.batchBox.getValue());
+            return Mth.clamp(value, 1, BATCH_MAX);
+        } catch (NumberFormatException ignored) {
+            return BATCH_DEFAULT;
+        }
     }
 
     private boolean isPointInFoldButton(double mouseX, double mouseY) {

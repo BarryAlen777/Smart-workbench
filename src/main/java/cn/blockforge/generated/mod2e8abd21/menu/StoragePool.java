@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -117,6 +118,11 @@ public final class StoragePool {
             }
         }
         return result;
+    }
+
+    /** 库存里出现过哪些物品种类（只看种类、不看数量），给链式可达性闭包用。 */
+    public Set<Item> distinctItems() {
+        return new HashSet<>(this.byItem.keySet());
     }
 
     /** 把本地计数恢复到仓库当前数量（每个配方单独试一次时用）。 */

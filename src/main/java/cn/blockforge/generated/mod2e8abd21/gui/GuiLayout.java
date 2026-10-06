@@ -29,12 +29,12 @@ public final class GuiLayout {
 
     /* 产物格 */
     public static final int OUTPUT_ITEM_X = 122;
-    public static final int OUTPUT_ITEM_Y = 35;
+    public static final int OUTPUT_ITEM_Y = 17;
     public static final int OUTPUT_BOX = 26;
 
     /* 合成箭头 */
     public static final int ARROW_X = 88;
-    public static final int ARROW_Y = 36;
+    public static final int ARROW_Y = 18;
     public static final int ARROW_WIDTH = 22;
     public static final int ARROW_HEIGHT = 14;
 
@@ -111,6 +111,16 @@ public final class GuiLayout {
     /* 接入存储计数 */
     public static final int STORAGE_X = 182;
     public static final int STORAGE_Y = 143;
+
+    /* 批量合成数量输入框 */
+    public static final int BATCH_INPUT_X = 122;
+    public static final int BATCH_INPUT_Y = 44;
+    public static final int BATCH_INPUT_WIDTH = 48;
+    public static final int BATCH_INPUT_HEIGHT = 12;
+
+    /* 批量数量标签 */
+    public static final int BATCH_LABEL_X = 86;
+    public static final int BATCH_LABEL_Y = 46;
 
     /** 配色 0xAARRGGBB，和贴图同一套。 */
     public static final int TEXT_COLOR = 0xFF4C4B63;

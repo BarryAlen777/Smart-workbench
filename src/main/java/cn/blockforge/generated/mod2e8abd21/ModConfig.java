@@ -17,7 +17,9 @@ import java.util.List;
  *   <li>读取玩家身上/物品栏里精妙背包的范围（默认 3x3x3，最大 50x50x50）；</li>
  *   <li>扳手手动绑定「取料容器」的上限（1~50）；</li>
  *   <li>扳手手动绑定「输出容器」的上限（1~50）；</li>
- *   <li>一次自动合成最多做多少个（默认 64，最大 12318）。</li>
+ *   <li>一次自动合成最多做多少个（默认 64，最大 12318）；</li>
+ *   <li>链式合成的递归深度、展开步数、搜索预算（防止又深又绕的配方树拖住服务器）；</li>
+ *   <li>右侧列表里「数量够不够」复核的预算。</li>
  * </ul>
  * 另外保留了黑白名单和界面列表容量两项旧配置。
  */
@@ -51,6 +53,12 @@ public final class ModConfig {
     public static final ForgeConfigSpec.IntValue MAX_INPUT_BINDINGS;
     public static final ForgeConfigSpec.IntValue MAX_OUTPUT_BINDINGS;
     public static final ForgeConfigSpec.IntValue AUTO_CRAFT_LIMIT;
+    public static final ForgeConfigSpec.BooleanValue BATCH_USE_ALL_MATERIALS;
+    public static final ForgeConfigSpec.BooleanValue SHOW_CHAIN_CRAFTABLES;
+    public static final ForgeConfigSpec.IntValue RECURSIVE_MAX_DEPTH;
+    public static final ForgeConfigSpec.IntValue RECURSIVE_MAX_STEPS;
+    public static final ForgeConfigSpec.IntValue RECURSIVE_NODE_BUDGET;
+    public static final ForgeConfigSpec.IntValue CHAIN_VERIFY_BUDGET;
     public static final ForgeConfigSpec.IntValue LIST_SLOTS;
     public static final ForgeConfigSpec.ConfigValue<List<? extends String>> STORAGE_BLACKLIST;
 
@@ -91,6 +99,39 @@ public final class ModConfig {
         AUTO_CRAFT_LIMIT = builder
                 .comment("点一次「自动合成」最多做多少个，默认 64，最大 12318。")
                 .defineInRange("autoCraftLimit", 64, 1, 12318);
+        BATCH_USE_ALL_MATERIALS = builder
+                .comment("批量合成（按批量合成键点击）是否一直做到材料用完为止。",
+                        "false（默认）：按工作台界面上「批量数量」框里填的次数合成，做满就停；",
+                        "true：旧行为，忽略数量框，一直做到材料不够或达到单次上限。")
+                .define("batchUseAllMaterials", false);
+        SHOW_CHAIN_CRAFTABLES = builder
+                .comment("右侧可合成列表是否额外显示「链式」项（带「链」角标）：",
+                        "直接材料不齐、但把缺的中间材料沿配方树补做出来后能合成的物品。",
+                        "点这些项会先自动补做中间材料（需要界面上「自动补齐」开着）。",
+                        "超大整合包里如果觉得列表刷新偏慢，可以关掉它回到只显示直接可合成。")
+                .define("showChainCraftables", true);
+        RECURSIVE_MAX_DEPTH = builder
+                .comment("链式合成（自动补齐）最多顺着配方树往下挖多少层。默认 16，最大 64。",
+                        "例：原木 -> 木板 -> 木棍 -> 工具，是 3 层。层数越深，能自动补出来的东西越多，",
+                        "搜索也越贵。默认值已经能覆盖原版和绝大多数模组配方。")
+                .defineInRange("recursiveMaxDepth", 16, 1, 64);
+        RECURSIVE_MAX_STEPS = builder
+                .comment("一次链式合成最多补做多少份中间配方。默认 256，最大 4096。",
+                        "这是防跑飞的硬上限：像「a 能合成 b，b 能合成 c、d、e、f……」，",
+                        "配方树可能组合爆炸，到达上限就停下并提示材料不足，不会卡住服务器。")
+                .defineInRange("recursiveMaxSteps", 256, 4, 4096);
+        RECURSIVE_NODE_BUDGET = builder
+                .comment("一次链式合成最多尝试多少个「规划节点」。默认 200000，最大 20000000。",
+                        "深度和步数限住的是「做多少」，这个限住的是「试多少」：",
+                        "配方树里备选配方多的时候，回退重试的次数可能远超实际步数。",
+                        "到达上限会停止并提示「链式合成太复杂」；正常玩法用不到调它。")
+                .defineInRange("recursiveNodeBudget", 200_000, 1_000, 20_000_000);
+        CHAIN_VERIFY_BUDGET = builder
+                .comment("右侧列表复核「链式项数量到底够不够」时，整轮最多计算多少个节点。",
+                        "默认 100000。复核是为了不让「差点材料」的项混进列表（点下去才报缺料）。",
+                        "预算用尽时会停止复核、保留剩余项，只慢不丢；",
+                        "觉得列表刷新偏慢可以调小，想复核得更彻底可以调大，填 0 表示完全不复核。")
+                .defineInRange("chainVerifyBudget", 100_000, 0, 5_000_000);
         builder.pop();
 
         SPEC = builder.build();
@@ -139,6 +180,36 @@ public final class ModConfig {
 
     public static int autoCraftLimit() {
         return Math.max(1, AUTO_CRAFT_LIMIT.get());
+    }
+
+    /** 批量合成是否忽略数量框、一直做到材料用完（旧行为）。 */
+    public static boolean batchUseAllMaterials() {
+        return Boolean.TRUE.equals(BATCH_USE_ALL_MATERIALS.get());
+    }
+
+    /** 列表是否显示需要链式补做的「链」项。 */
+    public static boolean showChainCraftables() {
+        return Boolean.TRUE.equals(SHOW_CHAIN_CRAFTABLES.get());
+    }
+
+    /** 链式合成最多往下挖多少层。 */
+    public static int recursiveMaxDepth() {
+        return Math.max(1, RECURSIVE_MAX_DEPTH.get());
+    }
+
+    /** 一次链式合成最多补做多少份中间配方。 */
+    public static int recursiveMaxSteps() {
+        return Math.max(1, RECURSIVE_MAX_STEPS.get());
+    }
+
+    /** 一次链式合成最多尝试多少个规划节点。 */
+    public static int recursiveNodeBudget() {
+        return Math.max(1, RECURSIVE_NODE_BUDGET.get());
+    }
+
+    /** 整轮列表复核的节点预算；0 表示不复核。 */
+    public static int chainVerifyBudget() {
+        return Math.max(0, CHAIN_VERIFY_BUDGET.get());
     }
 
     public static int maxListSize() {
