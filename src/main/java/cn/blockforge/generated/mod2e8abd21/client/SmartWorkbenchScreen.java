@@ -4,7 +4,6 @@ import cn.blockforge.generated.mod2e8abd21.ModNetwork;
 import cn.blockforge.generated.mod2e8abd21.SmartWorkbenchMod;
 import cn.blockforge.generated.mod2e8abd21.compat.EmiTransferBridge;
 import cn.blockforge.generated.mod2e8abd21.compat.JeiTransferBridge;
-import cn.blockforge.generated.mod2e8abd21.compat.PolymorphCompat;
 import cn.blockforge.generated.mod2e8abd21.compat.ReiTransferBridge;
 import cn.blockforge.generated.mod2e8abd21.gui.GuiLayout;
 import cn.blockforge.generated.mod2e8abd21.menu.CraftableEntry;
@@ -36,8 +35,8 @@ import net.minecraftforge.client.settings.KeyModifier;
 import org.lwjgl.glfw.GLFW;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -108,13 +107,15 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
     private static final int SELECT_COLOR = 0xFFE0A83C;
     /** 链式可合成项的角标颜色。 */
     private static final int CHAIN_COLOR = 0xFFB07CFF;
+    /** 「可换配方」角标的颜色：和链式的紫色分得开的草绿。 */
+    private static final int ALT_COLOR = 0xFF8FE6A6;
     /**
-     * 「链」角标的缩放比例。
+     * 格子角标的通用缩放比例：「链」「换」，以及右下角的数量数字，统统缩到这个大小。
      * <p>
      * 1.0 是原版字号（约 8x8），压在 16x16 的图标上显得很挤；0.65 缩到约 5x6，
-     * 既不挡物品又还认得出是个「链」字。别调得比 0.5 更小，再小汉字就糊成一团了。
+     * 既不挡物品又还认得出。别调得比 0.5 更小，再小汉字就糊成一团了。
      */
-    private static final float CHAIN_BADGE_SCALE = 0.65F;
+    private static final float BADGE_SCALE = 0.65F;
     private static final int BATCH_DEFAULT = 16;
     private static final int BATCH_MAX = 1024;
     /** 同类折叠头的描边色（青），和选中的金色区分开。 */
@@ -199,6 +200,17 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
     private boolean displayDirty = true;
     /** display 是照着哪一份 craftables 算的，换了对象就重算。 */
     private List<CraftableEntry> displaySource;
+    /**
+     * 玩家右键换过的配方：产物 → 选用的那份配方 ID。
+     * <p>
+     * 同一件产物有好几份材料不同的配方时，服务端只发一条列表项（外加候选清单），
+     * 具体在用哪一份由玩家在这个界面里临时决定，不用回服务端——点哪份配方取料，
+     * 发出去的就是当前选中的那个 ID。列表刷新后仍然记得住：按产物的身份找回来，
+     * 那份配方没了就自动回到默认的。
+     */
+    private final Map<String, ResourceLocation> chosenRecipes = new HashMap<>();
+    /** 把候选换成玩家选中那份之后的列表，提示框和快捷键都从这里找。 */
+    private List<CraftableEntry> effectiveCraftables = List.of();
 
     public SmartWorkbenchScreen(SmartWorkbenchMenu menu, Inventory playerInventory, Component title) {
         super(menu, playerInventory, title);
@@ -276,9 +288,57 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         }
         this.displaySource = source;
         this.displayDirty = false;
+        this.effectiveCraftables = applyChoices(source);
         String query = this.searchBox == null ? "" : this.searchBox.getValue();
-        this.display = CraftableListView.build(source, query, this.folding, this.expandedGroups);
+        this.display = CraftableListView.build(this.effectiveCraftables, query, this.folding,
+                this.expandedGroups);
         this.scroll = Mth.clamp(this.scroll, 0, maxScroll());
+    }
+
+    /**
+     * 把玩家右键选过的配方套到列表项上：换过去的那份变成这一项「当前用的配方」，
+     * 图标不变、材料清单和取料走的配方都跟着换。选过的那份配方这次没了（材料变化、
+     * 模组重载）就退回服务端给的默认那份。
+     */
+    private List<CraftableEntry> applyChoices(List<CraftableEntry> source) {
+        if (this.chosenRecipes.isEmpty()) {
+            return source;
+        }
+        List<CraftableEntry> out = new ArrayList<>(source.size());
+        for (CraftableEntry entry : source) {
+            out.add(entry.hasAlternatives()
+                    ? entry.withActive(this.chosenRecipes.get(entry.resultKey()))
+                    : entry);
+        }
+        return out;
+    }
+
+    /**
+     * 右键列表项：这件产物有好几份材料不同的配方，换用下一份。
+     * <p>
+     * 为什么自己做这个：多态合成（Polymorph）那个产物格旁的小按钮管的是
+     * <b>同一把材料能出哪几个不同产物</b>；我们这里正相反——<b>同一个产物有几套不同材料</b>，
+     * 摆好料之后永远只有一份配方匹配，多态合成压根不会冒出按钮。所以切换只能在这份列表里做。
+     */
+    private void cycleRecipe(CraftableEntry entry) {
+        CraftableEntry next = entry.cycled();
+        if (next.recipeId().equals(entry.recipeId())) {
+            return;
+        }
+        this.chosenRecipes.put(entry.resultKey(), next.recipeId());
+        // 选中项描边按配方 id 记，跟着换过去，免得换完配方金边就跑没了
+        if (this.selectedRecipe != null && this.selectedRecipe.equals(entry.recipeId())) {
+            this.selectedRecipe = next.recipeId();
+        }
+        this.displayDirty = true;
+        ensureDisplay();
+        playClickSound();
+        if (this.minecraft != null && this.minecraft.player != null) {
+            this.minecraft.player.displayClientMessage(
+                    labelArgs("gui." + SmartWorkbenchMod.MOD_ID + ".msg.recipe_switched",
+                            "换用配方：%s（这件产物共 %s 份配方，右键继续换）",
+                            next.recipeId(), entry.optionCount()), true);
+        }
     }
 
     @Override
@@ -341,10 +401,14 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
                 if (!cell.header() && cell.entry().chain()) {
                     drawChainBadge(graphics, x, y);
                 }
+                if (!cell.header() && cell.entry().hasAlternatives()) {
+                    // 这件产物还有别的材料能做：画个「换」，右键这一格就能换一份配方
+                    drawAltBadge(graphics, x, y);
+                }
                 if (cell.header()) {
                     drawGroupHeader(graphics, cell, x, y);
                 } else {
-                    graphics.renderItemDecorations(this.font, result, x, y);
+                    drawSmallCount(graphics, result, x, y);
                 }
             }
         }
@@ -517,10 +581,10 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
     /**
      * 链式项角标：提醒玩家这项需要先补做中间材料。
      * <p>
-     * 角标按 {@link #CHAIN_BADGE_SCALE} 缩小后贴在格子右上角。早前是原尺寸的「链」字，
+     * 角标按 {@link #BADGE_SCALE} 缩小后贴在格子右上角。早前是原尺寸的「链」字，
      * 一个 8x8 的字压在 16x16 的图标上盖掉将近四分之一，玩家反馈「有点挡住物品」；
      * 缩到 0.65 后只占 6x6，加上描边仍然认得出来，物品的轮廓基本完整。
-     * 放右上角是刻意的：右下角是原版的堆叠数量，两边不会打架。
+     * 放右上角是刻意的：右下角是同样缩小的堆叠数量，两边不会打架。
      */
     private void drawChainBadge(GuiGraphics graphics, int x, int y) {
         String mark = label("gui." + SmartWorkbenchMod.MOD_ID + ".badge.chain", "链").getString();
@@ -528,10 +592,50 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         graphics.pose().translate(0.0F, 0.0F, GROUP_CHIP_Z);
         // 先按屏幕坐标把原点挪到角标左上角，再整体缩放——缩放后的字号是 w*scale，
         // 所以要拿缩放后的宽度来算右对齐。
-        graphics.pose().translate(x + CELL - 2 - this.font.width(mark) * CHAIN_BADGE_SCALE, y,
+        graphics.pose().translate(x + CELL - 2 - this.font.width(mark) * BADGE_SCALE, y,
                 0.0F);
-        graphics.pose().scale(CHAIN_BADGE_SCALE, CHAIN_BADGE_SCALE, 1.0F);
+        graphics.pose().scale(BADGE_SCALE, BADGE_SCALE, 1.0F);
         drawOutlinedChar(graphics, mark, 0, 0, CHAIN_COLOR);
+        graphics.pose().popPose();
+    }
+
+    /**
+     * 「可换配方」角标：这件产物还有别的材料组合能做出来的记号。
+     * <p>
+     * 和「链」角标一样缩到 {@link #BADGE_SCALE}，但放在<b>左下角</b>：右上角是链式记号、
+     * 右下角是同样大小的数量数字，左下角是格子里唯一没人占的角，三种记号能同时出现也不打架。
+     * 看到这个字就知道右键这一格有别的东西可换，具体换法写在提示框里。
+     */
+    private void drawAltBadge(GuiGraphics graphics, int x, int y) {
+        String mark = label("gui." + SmartWorkbenchMod.MOD_ID + ".badge.alt", "换").getString();
+        graphics.pose().pushPose();
+        graphics.pose().translate(0.0F, 0.0F, GROUP_CHIP_Z);
+        graphics.pose().translate((float) x, (float) (y + 9), 0.0F);
+        graphics.pose().scale(BADGE_SCALE, BADGE_SCALE, 1.0F);
+        drawOutlinedChar(graphics, mark, 0, 0, ALT_COLOR);
+        graphics.pose().popPose();
+    }
+
+    /**
+     * 右下角的堆叠数量角标：缩到和「链」「换」一样大（{@link #BADGE_SCALE}）。
+     * <p>
+     * 早前这里走的是原版 {@link GuiGraphics#renderItemDecorations}，折叠头的成员数更是
+     * 按原字号直接画——玩家反馈右下角的数字太大、挡住物品。现在列表里两类格子的数字
+     * 统一由本模组自己画：黑描边白字、贴右下角，和另外两个角标一个大小一个风格。
+     * 数量 1 不画（和原版一致），超过 999 显示成 999+。
+     */
+    private void drawSmallCount(GuiGraphics graphics, ItemStack stack, int x, int y) {
+        int count = stack.getCount();
+        if (count <= 1) {
+            return;
+        }
+        String text = count > 999 ? "999+" : String.valueOf(count);
+        graphics.pose().pushPose();
+        graphics.pose().translate(0.0F, 0.0F, GROUP_CHIP_Z);
+        // 先按缩放后的宽度右对齐到格子右下角，再整体缩放——和「链」角标同一套算法。
+        graphics.pose().translate(x + CELL - 2 - this.font.width(text) * BADGE_SCALE, y + 9, 0.0F);
+        graphics.pose().scale(BADGE_SCALE, BADGE_SCALE, 1.0F);
+        drawOutlinedChar(graphics, text, 0, 0, GROUP_COUNT_COLOR);
         graphics.pose().popPose();
     }
 
@@ -557,8 +661,13 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         graphics.renderOutline(x - 1, y - 1, CELL, CELL, GROUP_COLOR);
         String mark = this.expandedGroups.contains(cell.groupKey()) ? "-" : "+";
         drawOutlinedChar(graphics, mark, x + 1, y + 1, GROUP_COLOR);
+        // 成员数缩到和「链」「换」一样大，位置、右对齐算法都和普通格子的数量角标保持一致。
         String count = String.valueOf(cell.groupSize());
-        drawOutlinedChar(graphics, count, x + CELL - 2 - this.font.width(count), y + 9, GROUP_COUNT_COLOR);
+        graphics.pose().pushPose();
+        graphics.pose().translate(x + CELL - 2 - this.font.width(count) * BADGE_SCALE, y + 9, 0.0F);
+        graphics.pose().scale(BADGE_SCALE, BADGE_SCALE, 1.0F);
+        drawOutlinedChar(graphics, count, 0, 0, GROUP_COUNT_COLOR);
+        graphics.pose().popPose();
         graphics.pose().popPose();
     }
 
@@ -588,6 +697,18 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
             return true;
         }
         ensureDisplay();
+        // 右键列表项 = 换一份配方。只在「这件产物确实有好几份材料不同的配方」时生效，
+        // 否则不吃这一下，留给原版处理。为什么不用多态合成的按钮：见 cycleRecipe 的说明。
+        if (button == 1) {
+            int altIndex = cellIndexAt(mouseX, mouseY);
+            if (altIndex >= 0) {
+                CraftableListView.Cell cell = this.display.get(altIndex);
+                if (!cell.header() && cell.entry().hasAlternatives()) {
+                    cycleRecipe(cell.entry());
+                    return true;
+                }
+            }
+        }
         // 全部展开 / 全部折叠（默认 空格+左键，按键可改，和自动合成不再共用 Alt+左键）：
         // 点在右侧列表区域上生效——有收起的就全展开，全开着就全收起；列表里没有折叠项时不吃这一下点击。
         if (isHeldClickGesture(ModKeyMappings.EXPAND_ALL, button)
@@ -845,7 +966,9 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         if (this.selectedRecipe == null) {
             return null;
         }
-        for (CraftableEntry entry : this.menu.getCraftables()) {
+        // 用换过配方之后的那份列表：玩家右键选中的那份配方，自动合成要合成的也是它。
+        ensureDisplay();
+        for (CraftableEntry entry : this.effectiveCraftables) {
             if (this.selectedRecipe.equals(entry.recipeId())) {
                 return entry;
             }
@@ -1024,7 +1147,9 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
                 : this.minecraft.level.getRecipeManager().<Recipe<?>>byKey(entry.recipeId()).orElse(null);
         if (recipe != null) {
             NonNullList<Ingredient> ingredients = recipe.getIngredients();
-            Map<ItemStack, Integer> merged = new LinkedHashMap<>();
+            // 同一种材料摆了几格就合并成「钻石x8」，不再一格一行刷一长串「钻石x1」。
+            List<ItemStack> kinds = new ArrayList<>();
+            List<Integer> counts = new ArrayList<>();
             for (Ingredient ingredient : ingredients) {
                 if (ingredient.isEmpty()) {
                     continue;
@@ -1033,27 +1158,39 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
                 if (previews.length == 0) {
                     continue;
                 }
-                merged.merge(previews[0].copy(), 1, Integer::sum);
+                ItemStack preview = previews[0];
+                int at = -1;
+                for (int i = 0; i < kinds.size(); i++) {
+                    if (ItemStack.isSameItemSameTags(kinds.get(i), preview)) {
+                        at = i;
+                        break;
+                    }
+                }
+                if (at < 0) {
+                    kinds.add(preview.copy());
+                    counts.add(1);
+                } else {
+                    counts.set(at, counts.get(at) + 1);
+                }
             }
-            for (Map.Entry<ItemStack, Integer> stackEntry : merged.entrySet()) {
-                lines.add(stackEntry.getKey().getHoverName().copy()
-                        .append("x" + stackEntry.getValue()).withStyle(ChatFormatting.GRAY));
+            for (int i = 0; i < kinds.size(); i++) {
+                lines.add(kinds.get(i).getHoverName().copy()
+                        .append("x" + counts.get(i)).withStyle(ChatFormatting.GRAY));
             }
         }
-        // 一件产物可能有好几份配方（不同模组各加一份）。把来源和份数写出来，
+        // 一件产物可能有好几份配方（不同材料都能做出来）。把来源和份数写出来，
         // 玩家才知道列表里两个长得一样的图标到底差在哪、该怎么选。
         if (entry.recipeId() != null) {
             lines.add(labelArgs("gui." + SmartWorkbenchMod.MOD_ID + ".tooltip.recipe_source",
                             "配方来源：%s", entry.recipeId().getNamespace())
                     .withStyle(ChatFormatting.DARK_GRAY));
         }
-        int sameOutput = countSameOutput(entry);
+        // 注意这里说的是「同一个产物、几套不同材料」，跟多态合成（同一把材料出不同产物）
+        // 不是一回事，多态合成的按钮在这种配方上永远不会出现，所以切换由本模组自己做：右键换。
+        int sameOutput = entry.optionCount();
         if (sameOutput > 1) {
-            lines.add((PolymorphCompat.isLoaded()
-                    ? labelArgs("gui." + SmartWorkbenchMod.MOD_ID + ".tooltip.polymorph",
-                            "这件产物有 %s 份配方，取料后可用产物格旁的多态合成按钮切换", sameOutput)
-                    : labelArgs("gui." + SmartWorkbenchMod.MOD_ID + ".tooltip.duplicate",
-                            "这件产物有 %s 份配方，点哪一项就用哪一份", sameOutput))
+            lines.add(labelArgs("gui." + SmartWorkbenchMod.MOD_ID + ".tooltip.alternatives",
+                            "这件产物有 %s 份材料不同的配方，列表只显示一份；右键这一格可换下一份", sameOutput)
                     .withStyle(ChatFormatting.AQUA));
         }
         if (entry.chain()) {
@@ -1077,17 +1214,6 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
                         fullKeybindText(ModKeyMappings.AUTO_CRAFT))
                 .withStyle(ChatFormatting.GOLD));
         return lines;
-    }
-
-    /** 列表里还有几项是同一件产物。 */
-    private int countSameOutput(CraftableEntry entry) {
-        int count = 0;
-        for (CraftableEntry other : this.menu.getCraftables()) {
-            if (ItemStack.isSameItemSameTags(other.result(), entry.result())) {
-                count++;
-            }
-        }
-        return count;
     }
 
     /** 文本组件；返回 MutableComponent 才能直接 withStyle（Component 接口上没有这个方法）。 */

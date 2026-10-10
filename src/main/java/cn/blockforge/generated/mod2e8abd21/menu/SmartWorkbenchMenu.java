@@ -12,7 +12,6 @@ import cn.blockforge.generated.mod2e8abd21.network.S2CAutoRefillPacket;
 import cn.blockforge.generated.mod2e8abd21.network.S2CCraftableListPacket;
 import cn.blockforge.generated.mod2e8abd21.network.S2CRecursiveCraftPromptPacket;
 import net.minecraft.core.BlockPos;
-import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.NonNullList;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.FriendlyByteBuf;
@@ -619,8 +618,9 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     @Override
     public void handlePlacement(boolean placeAll, Recipe<?> recipe, ServerPlayer player) {
         if (this.level.isClientSide || this.bench == null
-                || !(recipe instanceof CraftingRecipe crafting) || !isPlainCraft(crafting)) {
-            // 特殊配方（修装备、复制旗帜之类）不接管
+                || !(recipe instanceof CraftingRecipe crafting) || !isPlainCraft(crafting)
+                || !matchesWithOwnPreviews(crafting)) {
+            // 特殊配方（修装备、复制旗帜、双箱子升级这类「材料表骗人」的）不接管
             return;
         }
         if (this.autoRefillEnabled) {
@@ -1194,7 +1194,8 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             return;
         }
         Recipe<?> recipe = this.level.getRecipeManager().byKey(recipeId).orElse(null);
-        if (!(recipe instanceof CraftingRecipe crafting) || !isPlainCraft(crafting)) {
+        if (!(recipe instanceof CraftingRecipe crafting) || !isPlainCraft(crafting)
+                || !matchesWithOwnPreviews(crafting)) {
             notify(player, "这个配方不支持一键取料", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.unsupported");
             return;
         }
@@ -1316,13 +1317,14 @@ public class SmartWorkbenchMenu extends CraftingMenu {
                 }
                 ItemStack result = recipe.getResultItem(this.level.registryAccess());
                 if (!result.isEmpty()) {
-                    next.add(new CraftableEntry(recipe.getId(), result.copy(), false));
+                    next.add(CraftableEntry.of(recipe.getId(), result.copy(), false));
                     directIds.add(recipe.getId());
                     directOutputs.add(result.getItem());
                 }
             }
             next.sort(Comparator.comparing(entry -> entry.result().getItem().getDescriptionId()));
             next.addAll(collectChainEntries(pool, directIds, directOutputs, max - next.size()));
+            next = dedupeByResult(next);
         }
         this.craftables = next;
         if (this.player instanceof ServerPlayer serverPlayer) {
@@ -1403,11 +1405,36 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             }
             ItemStack result = recipe.getResultItem(this.level.registryAccess());
             if (!result.isEmpty()) {
-                out.add(new CraftableEntry(entry.getKey(), result.copy(), true));
+                out.add(CraftableEntry.of(entry.getKey(), result.copy(), true));
             }
         }
         out.sort(Comparator.comparing(entry -> entry.result().getItem().getDescriptionId()));
         return out.size() > budget ? new ArrayList<>(out.subList(0, budget)) : out;
+    }
+
+    /**
+     * 同一件产物只留一条列表项：排在前的当「当前用的那份」（直接项先于链式项），
+     * 后来的收进这条的候选清单。不然玩家会看到两个一模一样的图标——比如精妙存储的
+     * 木箱有「木板+拉杆」和「原版箱子+拉杆」两份配方，图标完全相同，分不清点哪个。
+     * <p>
+     * 候选清单要一路带到客户端：界面上右键那一格就能在几份配方之间轮换
+     * （见 {@code SmartWorkbenchScreen#cycleRecipe}）。这跟多态合成无关——
+     * 多态合成管「同一把材料出哪个产物」，这里问的是「同一个产物用哪套材料」。
+     */
+    private static List<CraftableEntry> dedupeByResult(List<CraftableEntry> entries) {
+        Map<String, Integer> firstAt = new HashMap<>();
+        List<CraftableEntry> out = new ArrayList<>(entries.size());
+        for (CraftableEntry entry : entries) {
+            String key = CraftableEntry.resultKey(entry.result());
+            Integer at = firstAt.get(key);
+            if (at == null) {
+                firstAt.put(key, out.size());
+                out.add(entry);
+            } else {
+                out.set(at, out.get(at).mergedWith(entry));
+            }
+        }
+        return out;
     }
 
     /**
@@ -1512,12 +1539,63 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     }
 
     /**
+     * 特殊配方自匹配复核：把「每种材料的第一候选」按一键取料的摆法放进 3x3，
+     * 问配方本身 {@code matches()} 认不认。
+     * <p>
+     * 背景：精妙存储的 {@code sophisticatedstorage:double_chest_tier_upgrade}
+     * （双联箱子升档）在 JSON 里写的是「金箱子 + 钻石 + 钻石块」，产物图标和普通的
+     * 钻石箱子配方一模一样；但它的 {@code matches()} 实际要求格子里那只箱子必须是
+     * <b>双联</b>金箱子——而双联箱子物品做不出配方，只能摆两个箱子合出来。
+     * 于是这份配方在列表里是「看着能做、点了永远缺料」的假项，链式规划还会拿它
+     * 当中转站，绕出一屏「箱子x4、铜块x336」这种莫名其妙的缺口。
+     * <p>
+     * 普通（非 special）配方材料表就是全部条件，预览摆法必然匹配，不必复核；
+     * special 配方里能正常一键取料的（如 {@code storage_tier_upgrade} 钻石围金箱）
+     * 复核同样通过，不受影响。复核抛异常按不通过处理——那种配方连自己的材料表
+     * 都不认，摆进真格子只会更糟。
+     */
+    private boolean matchesWithOwnPreviews(CraftingRecipe recipe) {
+        if (!recipe.isSpecial()) {
+            return true;
+        }
+        NonNullList<Ingredient> ingredients = recipe.getIngredients();
+        NonNullList<ItemStack> items = NonNullList.withSize(SmartWorkbenchBlockEntity.GRID_SIZE, ItemStack.EMPTY);
+        int[] layout = gridLayout(recipe, ingredients);
+        for (int i = 0; i < ingredients.size(); i++) {
+            Ingredient ingredient = ingredients.get(i);
+            if (ingredient.isEmpty()) {
+                continue;
+            }
+            ItemStack[] previews = ingredient.getItems();
+            if (previews.length == 0) {
+                return false;
+            }
+            int slot = layout[i];
+            if (slot < 0 || slot >= SmartWorkbenchBlockEntity.GRID_SIZE || !items.get(slot).isEmpty()) {
+                return false;
+            }
+            items.set(slot, previews[0].copyWithCount(1));
+        }
+        TransientCraftingContainer grid = new TransientCraftingContainer(this, COLUMNS, ROWS, items);
+        ServerPlayer feedbackPlayer = this.player instanceof ServerPlayer serverPlayer ? serverPlayer : null;
+        try {
+            ForgeHooks.setCraftingPlayer(feedbackPlayer);
+            return recipe.matches(grid, this.level);
+        } catch (Throwable ignored) {
+            return false;
+        } finally {
+            ForgeHooks.setCraftingPlayer(null);
+        }
+    }
+
+    /**
      * 给 JEI / EMI 的桥用：这份配方能不能一键从存储取料。
      * 判断规则和服务器端 {@link #placeRecipeFromClient} 完全一致，免得界面上显示能点、
      * 点下去服务端又说不行。
      */
     public boolean canAutoPlace(Recipe<?> recipe) {
-        return recipe instanceof CraftingRecipe crafting && isPlainCraft(crafting);
+        return recipe instanceof CraftingRecipe crafting && isPlainCraft(crafting)
+                && matchesWithOwnPreviews(crafting);
     }
 
     private static int recipeWidth(CraftingRecipe recipe) {
@@ -1567,7 +1645,8 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         }
         // 配方列表可能在网络包到达前刷新，因此按服务端真实 ID 重新解析，而不是信任客户端下标。
         Recipe<?> recipe = this.level.getRecipeManager().byKey(id).orElse(null);
-        return recipe instanceof CraftingRecipe crafting && isPlainCraft(crafting) ? crafting : null;
+        return recipe instanceof CraftingRecipe crafting && isPlainCraft(crafting)
+                && matchesWithOwnPreviews(crafting) ? crafting : null;
     }
 
     /* 从附近存储取料 */
@@ -2170,7 +2249,9 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             Map<net.minecraft.world.item.Item, List<CraftingRecipe>> byResult = new HashMap<>();
             Map<net.minecraft.world.item.Item, List<CraftingRecipe>> usingItem = new HashMap<>();
             for (CraftingRecipe recipe : this.level.getRecipeManager().getAllRecipesFor(RecipeType.CRAFTING)) {
-                if (!isPlainCraft(recipe)) {
+                // 材料表完整 + 特殊配方自匹配复核：双箱子升级这类「材料表骗人」的假配方
+                // 在这一处就被挡掉，列表、链式闭包、点击规划三条路共用这份索引，一起干净。
+                if (!isPlainCraft(recipe) || !matchesWithOwnPreviews(recipe)) {
                     continue;
                 }
                 recipes.add(recipe);
