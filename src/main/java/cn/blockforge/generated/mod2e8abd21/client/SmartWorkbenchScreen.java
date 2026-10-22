@@ -86,6 +86,12 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
     private static final int REFILL_BUTTON_W = GuiLayout.BTN_REFILL_WIDTH;
     private static final int REFILL_BUTTON_H = GuiLayout.BTN_REFILL_HEIGHT;
 
+    /** 合成格正下方的「清空」按钮（底色已画进贴图，这里只管高亮和文字）。 */
+    private static final int CLEAR_BUTTON_X = GuiLayout.BTN_CLEAR_X;
+    private static final int CLEAR_BUTTON_Y = GuiLayout.BTN_CLEAR_Y;
+    private static final int CLEAR_BUTTON_W = GuiLayout.BTN_CLEAR_WIDTH;
+    private static final int CLEAR_BUTTON_H = GuiLayout.BTN_CLEAR_HEIGHT;
+
     private static final int SEARCH_X = GuiLayout.SEARCH_X;
     private static final int SEARCH_Y = GuiLayout.SEARCH_Y;
     private static final int SEARCH_W = GuiLayout.SEARCH_WIDTH;
@@ -185,6 +191,15 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
     private boolean foldPressed;
     /** 鼠标是否悬停在折叠按钮上。 */
     private boolean foldHovered;
+    /** 「清空」按钮是否正被按住 / 悬停（按住要有原版那种下沉反馈，悬停要弹说明）。 */
+    private boolean clearPressed;
+    private boolean clearHovered;
+    /**
+     * 「链」「换」两个角标的文字。它们是语言文件里的固定词，每帧每格都去查一遍
+     * 翻译、再拼成字符串纯属白费力气，开界面时取一次就够。
+     */
+    private String chainBadgeText = "";
+    private String altBadgeText = "";
 
     /** 搜索框：只负责过滤右侧列表，不参与网络协议。 */
     private EditBox searchBox;
@@ -262,6 +277,8 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         this.batchBox.setHint(Component.empty());
         this.batchBox.setFilter(text -> text.matches("[0-9]*"));
         this.batchBox.setValue(previousBatch.isEmpty() ? String.valueOf(BATCH_DEFAULT) : previousBatch);
+        this.chainBadgeText = label("gui." + SmartWorkbenchMod.MOD_ID + ".badge.chain", "链").getString();
+        this.altBadgeText = label("gui." + SmartWorkbenchMod.MOD_ID + ".badge.alt", "换").getString();
         this.displayDirty = true;
         this.displaySource = null;
     }
@@ -376,42 +393,31 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         }
         drawBatchCountBox(graphics, mouseX, mouseY, partialTick);
 
-        // 5x5 的配方图标
+        // 5x5 的配方图标。
+        // 露出来的这一窗格子下标是连续的（row*COLS+col），所以从 scroll*COLS 往后数就行；
+        // 第一遍只画每格的底和高亮加物品图标，角标文字留到第二遍一起画（见 drawCellBadges）。
         int hovered = cellIndexAt(mouseX, mouseY);
-        for (int row = 0; row < LIST_ROWS; row++) {
-            for (int col = 0; col < LIST_COLS; col++) {
-                int index = (this.scroll + row) * LIST_COLS + col;
-                if (index >= this.display.size()) {
-                    break;
-                }
-                CraftableListView.Cell cell = this.display.get(index);
-                int x = this.leftPos + LIST_X + col * CELL;
-                int y = this.topPos + LIST_Y + row * CELL;
-                if (hovered == index) {
-                    // 贴图上的格子框是 18x18，左上角比物品坐标各小 1 像素，高亮正好盖住整格
-                    graphics.fill(x - 1, y - 1, x + CELL - 1, y + CELL - 1, HOVER_BG);
-                }
-                if (!cell.header() && this.selectedRecipe != null
-                        && this.selectedRecipe.equals(cell.entry().recipeId())) {
-                    // 选中的那格描一圈金边：自动合成按钮和快捷键要作用在它身上
-                    graphics.renderOutline(x - 1, y - 1, CELL, CELL, SELECT_COLOR);
-                }
-                ItemStack result = cell.entry().result();
-                graphics.renderItem(result, x, y);
-                if (!cell.header() && cell.entry().chain()) {
-                    drawChainBadge(graphics, x, y);
-                }
-                if (!cell.header() && cell.entry().hasAlternatives()) {
-                    // 这件产物还有别的材料能做：画个「换」，右键这一格就能换一份配方
-                    drawAltBadge(graphics, x, y);
-                }
-                if (cell.header()) {
-                    drawGroupHeader(graphics, cell, x, y);
-                } else {
-                    drawSmallCount(graphics, result, x, y);
-                }
+        int firstCell = this.scroll * LIST_COLS;
+        int visibleCells = Math.max(0,
+                Math.min(this.display.size() - firstCell, LIST_ROWS * LIST_COLS));
+        int lastCell = firstCell + visibleCells;
+        for (int index = firstCell; index < lastCell; index++) {
+            CraftableListView.Cell cell = this.display.get(index);
+            int offset = index - firstCell;
+            int x = this.leftPos + LIST_X + (offset % LIST_COLS) * CELL;
+            int y = this.topPos + LIST_Y + (offset / LIST_COLS) * CELL;
+            if (hovered == index) {
+                // 贴图上的格子框是 18x18，左上角比物品坐标各小 1 像素，高亮正好盖住整格
+                graphics.fill(x - 1, y - 1, x + CELL - 1, y + CELL - 1, HOVER_BG);
             }
+            if (!cell.header() && this.selectedRecipe != null
+                    && this.selectedRecipe.equals(cell.entry().recipeId())) {
+                // 选中的那格描一圈金边：自动合成按钮和快捷键要作用在它身上
+                graphics.renderOutline(x - 1, y - 1, CELL, CELL, SELECT_COLOR);
+            }
+            graphics.renderItem(cell.entry().result(), x, y);
         }
+        drawCellBadges(graphics, firstCell, lastCell);
 
         if (this.display.isEmpty()) {
             String query = this.searchBox == null ? "" : this.searchBox.getValue();
@@ -443,6 +449,7 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         boolean autoHovered = isPointInAutoButton(mouseX, mouseY);
         boolean refillHovered = isPointInRefillButton(mouseX, mouseY);
         boolean foldHovered = isPointInFoldButton(mouseX, mouseY);
+        boolean clearHovered = isPointInClearButton(mouseX, mouseY);
         drawButton(graphics, AUTO_BUTTON_X, AUTO_BUTTON_Y, AUTO_BUTTON_W, AUTO_BUTTON_H,
                 autoHovered, this.autoPressed,
                 label("gui." + SmartWorkbenchMod.MOD_ID + ".button.auto", "自动"));
@@ -460,12 +467,18 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
                                 ? "gui." + SmartWorkbenchMod.MOD_ID + ".button.refill_on"
                                 : "gui." + SmartWorkbenchMod.MOD_ID + ".button.refill_off",
                         this.menu.isAutoRefillEnabled() ? "自动补齐：开" : "自动补齐：关"));
+        // 「清空」：格子里没料时把字压淡，一眼就知道这一按不会有任何东西退回去
+        drawButton(graphics, CLEAR_BUTTON_X, CLEAR_BUTTON_Y, CLEAR_BUTTON_W, CLEAR_BUTTON_H,
+                clearHovered, this.clearPressed,
+                label("gui." + SmartWorkbenchMod.MOD_ID + ".button.clear", "清空"),
+                isCraftGridEmpty() ? TEXT_DIM : TEXT_MAIN);
         // 按钮的说明文字不在这里画：renderBg 是背景层，画在这里会被上面的物品图标
         // 和数量角标压住（之前"自动合成"的说明就是这么糊在图标上的）。真正的最上层是
         // render 的末尾（所有图标、提示框都画完、并且把 z 抬到 TOOLTIP_Z 之后），那里才画按钮说明。
         this.autoHovered = autoHovered;
         this.refillHovered = refillHovered;
         this.foldHovered = foldHovered;
+        this.clearHovered = clearHovered;
 
         // 接入存储 / 输出容器数量只绘制一次且关闭阴影，避免浅色面板上出现重影。
         Component storageLine = Component.translatableWithFallback(
@@ -521,6 +534,10 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
                             ? "同类折叠：开。把同一种东西（比如各种木头的楼梯）收成一项，点它展开；再点这个按钮可关掉"
                             : "同类折叠：关。列表里的每一项都单独显示"),
                     FOLD_BUTTON_X, FOLD_BUTTON_Y, FOLD_BUTTON_W, FOLD_BUTTON_H);
+        } else if (this.clearHovered) {
+            drawButtonHint(graphics, label("gui." + SmartWorkbenchMod.MOD_ID + ".tooltip.clear",
+                            "清空合成格：从箱子拿来的材料原路退回那一台箱子那一格；自己手动摆进去的退回背包。产物格还没拿走的成品不受影响"),
+                    CLEAR_BUTTON_X, CLEAR_BUTTON_Y, CLEAR_BUTTON_W, CLEAR_BUTTON_H);
         }
     }
 
@@ -587,7 +604,7 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
      * 放右上角是刻意的：右下角是同样缩小的堆叠数量，两边不会打架。
      */
     private void drawChainBadge(GuiGraphics graphics, int x, int y) {
-        String mark = label("gui." + SmartWorkbenchMod.MOD_ID + ".badge.chain", "链").getString();
+        String mark = this.chainBadgeText;
         graphics.pose().pushPose();
         graphics.pose().translate(0.0F, 0.0F, GROUP_CHIP_Z);
         // 先按屏幕坐标把原点挪到角标左上角，再整体缩放——缩放后的字号是 w*scale，
@@ -607,7 +624,7 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
      * 看到这个字就知道右键这一格有别的东西可换，具体换法写在提示框里。
      */
     private void drawAltBadge(GuiGraphics graphics, int x, int y) {
-        String mark = label("gui." + SmartWorkbenchMod.MOD_ID + ".badge.alt", "换").getString();
+        String mark = this.altBadgeText;
         graphics.pose().pushPose();
         graphics.pose().translate(0.0F, 0.0F, GROUP_CHIP_Z);
         graphics.pose().translate((float) x, (float) (y + 9), 0.0F);
@@ -689,6 +706,49 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
             }
         }
         graphics.drawString(this.font, text, x, y, color, false);
+    }
+
+    /**
+     * 列表格子上那一层小字角标：「链」「换」「+/-」和右下角的数量。
+     * <p>
+     * <b>为什么要单独攒一层：</b>1.20.1 的 {@link GuiGraphics#drawString} 每画一小段字，
+     * 末尾都会走 {@code flushIfUnmanaged()}——在普通界面里这等于「把攒着的绘制立刻提交掉」
+     * （内部是 disableDepthTest → endBatch → enableDepthTest，一次真正的显卡提交）。
+     * 而一个角标为了描出黑边要把同一个字画 9 遍，于是<b>一个角标 = 9 次提交</b>；
+     * 25 格一起画，一帧光角标就八九百次提交，帧数全耗在这上面了
+     * （玩家实测：搜索框敲进 zzzz 让列表变空，帧数立刻回升，正是这个原因）。
+     * <p>
+     * {@link GuiGraphics#drawManaged} 是官方留的出口：这段里的绘制先攒在缓冲区，
+     * 出这段时统一提交一次。角标都落在物品图标之上、彼此不重叠，攒着画和一笔一笔画
+     * 长得一模一样，所以这里放心合并。
+     * <p>
+     * 注意：<b>物品图标本身不能放进来</b>。{@code renderItem} 会在内部设置并还原 3D 物品光照
+     * （{@code Lighting.setupFor3DItems()}），它的那次提交是不能省的，所以图标仍在前一遍单独画。
+     */
+    private void drawCellBadges(GuiGraphics graphics, int firstCell, int lastCell) {
+        if (firstCell >= lastCell) {
+            return;
+        }
+        graphics.drawManaged(() -> {
+            for (int index = firstCell; index < lastCell; index++) {
+                CraftableListView.Cell cell = this.display.get(index);
+                int offset = index - firstCell;
+                int x = this.leftPos + LIST_X + (offset % LIST_COLS) * CELL;
+                int y = this.topPos + LIST_Y + (offset / LIST_COLS) * CELL;
+                if (cell.header()) {
+                    drawGroupHeader(graphics, cell, x, y);
+                    continue;
+                }
+                if (cell.entry().chain()) {
+                    drawChainBadge(graphics, x, y);
+                }
+                if (cell.entry().hasAlternatives()) {
+                    // 这件产物还有别的材料能做：画个「换」，右键这一格就能换一份配方
+                    drawAltBadge(graphics, x, y);
+                }
+                drawSmallCount(graphics, cell.entry().result(), x, y);
+            }
+        });
     }
 
     @Override
@@ -782,6 +842,22 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
                 this.minecraft.gameMode.handleInventoryButtonClick(this.menu.containerId,
                         SmartWorkbenchMenu.BUTTON_AUTO_REFILL);
                 playClickSound();
+                return true;
+            }
+            if (isPointInClearButton(mouseX, mouseY)) {
+                this.clearPressed = true;
+                playClickSound();
+                // 格子空着就别发这个包了：服务端除了回一句"没材料"什么也不做，白跑一趟
+                if (isCraftGridEmpty()) {
+                    if (this.minecraft != null && this.minecraft.player != null) {
+                        this.minecraft.player.displayClientMessage(
+                                label("gui." + SmartWorkbenchMod.MOD_ID + ".msg.grid_nothing", "合成格里没有材料"),
+                                true);
+                    }
+                } else {
+                    this.minecraft.gameMode.handleInventoryButtonClick(this.menu.containerId,
+                            SmartWorkbenchMenu.BUTTON_CLEAR_GRID);
+                }
                 return true;
             }
             int index = cellIndexAt(mouseX, mouseY);
@@ -1031,6 +1107,7 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         this.refreshPressed = false;
         this.autoPressed = false;
         this.foldPressed = false;
+        this.clearPressed = false;
         boolean wasDragging = this.draggingScroll;
         this.draggingScroll = false;
         return wasDragging || super.mouseReleased(mouseX, mouseY, button);
@@ -1364,6 +1441,25 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         return mouseX >= x && mouseX < x + REFILL_BUTTON_W && mouseY >= y && mouseY < y + REFILL_BUTTON_H;
     }
 
+    private boolean isPointInClearButton(double mouseX, double mouseY) {
+        int x = this.leftPos + CLEAR_BUTTON_X;
+        int y = this.topPos + CLEAR_BUTTON_Y;
+        return mouseX >= x && mouseX < x + CLEAR_BUTTON_W && mouseY >= y && mouseY < y + CLEAR_BUTTON_H;
+    }
+
+    /**
+     * 3x3 合成格是不是全空。只读客户端这一侧的槽位（这些槽位由服务端同步过来），
+     * 用来决定「清空」按钮的字要不要压淡、以及这一下点击值不值得发包。
+     */
+    private boolean isCraftGridEmpty() {
+        for (int i = SmartWorkbenchMenu.GRID_START; i < SmartWorkbenchMenu.GRID_END; i++) {
+            if (this.menu.getSlot(i).hasItem()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /**
      * 这一点落在产物格（16x16 的物品区）上吗。坐标取自 {@link GuiLayout}，
      * 和菜单里 addSlot 用的是同一个来源，所以判定范围和槽位本体严丝合缝。
@@ -1377,13 +1473,23 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
     /** 画一个按钮的悬停/按下高亮和居中文字（底色已经在贴图里）。 */
     private void drawButton(GuiGraphics graphics, int x, int y, int w, int h,
                             boolean hovered, boolean down, Component text) {
+        drawButton(graphics, x, y, w, h, hovered, down, text, TEXT_MAIN);
+    }
+
+    /**
+     * 同上，多一个「平时用什么颜色」的参数：格子空着的「清空」要淡一点，
+     * 让玩家不点也知道这一按没东西可退。按下时仍然用更深的 TEXT_PRESSED，
+     * 那一下的反馈比颜色更重要。
+     */
+    private void drawButton(GuiGraphics graphics, int x, int y, int w, int h,
+                            boolean hovered, boolean down, Component text, int baseColor) {
         int px = this.leftPos + x;
         int py = this.topPos + y;
         if (hovered) {
             graphics.fill(px + 1, py + 1, px + w - 1, py + h - 1, down ? BUTTON_PRESSED : BUTTON_HOVER);
         }
         int textY = py + (h - this.font.lineHeight) / 2 + (down ? 1 : 0);
-        drawCentred(graphics, text, px + w / 2, textY, down ? TEXT_PRESSED : TEXT_MAIN, false);
+        drawCentred(graphics, text, px + w / 2, textY, down ? TEXT_PRESSED : baseColor, false);
     }
 
     private boolean isInsidePanel(double mouseX, double mouseY) {
@@ -1417,7 +1523,22 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
     protected void renderLabels(GuiGraphics graphics, int mouseX, int mouseY) {
         // 统一带阴影：贴图是带水彩纹理的浅色底，纯平的文字会发虚、和纹理糊在一起
         graphics.drawString(this.font, this.title, this.titleLabelX, this.titleLabelY, TEXT_MAIN, false);
-        graphics.drawString(this.font, this.playerInventoryTitle, this.inventoryLabelX,
+        graphics.drawString(this.font, inventoryLabelFor(), this.inventoryLabelX,
                 this.inventoryLabelY, TEXT_DIM, false);
+    }
+
+    /**
+     * 背包标签：它和新的「清空」按钮正好同一行（标签 y=72、按钮 y=70..82）。
+     * 中文「背包」18 像素，离按钮左边还留着 3 像素，没事；英文 "Inventory" 有 46 像素，
+     * 直接画就会压在按钮上、和按钮里的 "Clear" 糊成一片。所以量一下：放不下就改用
+     * 语言文件里的短标签（英文给 "Inv."，中文本来就是「背包」用不到）。
+     */
+    private Component inventoryLabelFor() {
+        int room = CLEAR_BUTTON_X - 3 - this.inventoryLabelX;
+        if (this.font.width(this.playerInventoryTitle) <= room) {
+            return this.playerInventoryTitle;
+        }
+        Component compact = label("gui." + SmartWorkbenchMod.MOD_ID + ".label.inventory_compact", "背包");
+        return this.font.width(compact) <= room ? compact : this.playerInventoryTitle;
     }
 }

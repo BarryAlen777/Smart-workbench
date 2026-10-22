@@ -58,6 +58,7 @@ public final class ModConfig {
     public static final ForgeConfigSpec.IntValue RECURSIVE_MAX_DEPTH;
     public static final ForgeConfigSpec.IntValue RECURSIVE_MAX_STEPS;
     public static final ForgeConfigSpec.IntValue RECURSIVE_NODE_BUDGET;
+    public static final ForgeConfigSpec.IntValue RECURSIVE_TIME_BUDGET_MS;
     public static final ForgeConfigSpec.IntValue CHAIN_VERIFY_BUDGET;
     public static final ForgeConfigSpec.IntValue LIST_SLOTS;
     public static final ForgeConfigSpec.ConfigValue<List<? extends String>> STORAGE_BLACKLIST;
@@ -126,6 +127,12 @@ public final class ModConfig {
                         "配方树里备选配方多的时候，回退重试的次数可能远超实际步数。",
                         "到达上限会停止并提示「链式合成太复杂」；正常玩法用不到调它。")
                 .defineInRange("recursiveNodeBudget", 200_000, 1_000, 20_000_000);
+        RECURSIVE_TIME_BUDGET_MS = builder
+                .comment("一次链式合成计算最多允许跑多少毫秒，超时立即中止。默认 2000，可填 200~60000。",
+                        "防卡死的硬性时间闸：超大整合包（上万配方、接了存储网络）里单次规划的成本不可预估，",
+                        "光靠节点预算可能刹不住车。超时后中止并提示「链式合成太复杂」，",
+                        "内置服务器最多卡顿这几毫秒，不会整局死住。正常玩法用不到调它。")
+                .defineInRange("recursiveTimeBudgetMs", 2000, 200, 60000);
         CHAIN_VERIFY_BUDGET = builder
                 .comment("右侧列表复核「链式项数量到底够不够」时，整轮最多计算多少个节点。",
                         "默认 100000。复核是为了不让「差点材料」的项混进列表（点下去才报缺料）。",
@@ -205,6 +212,11 @@ public final class ModConfig {
     /** 一次链式合成最多尝试多少个规划节点。 */
     public static int recursiveNodeBudget() {
         return Math.max(1, RECURSIVE_NODE_BUDGET.get());
+    }
+
+    /** 一次链式合成规划最多允许耗费的毫秒数（防卡死的硬性时间闸）。 */
+    public static int recursiveTimeBudgetMs() {
+        return Math.max(200, RECURSIVE_TIME_BUDGET_MS.get());
     }
 
     /** 整轮列表复核的节点预算；0 表示不复核。 */

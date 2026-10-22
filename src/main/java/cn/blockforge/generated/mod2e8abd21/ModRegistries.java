@@ -43,6 +43,10 @@ public final class ModRegistries {
                     BlockBehaviour.Properties.of()
                             .mapColor(MapColor.WOOD)
                             .strength(2.5F, 3.0F)
+                            // 模型中间一圈比整格缩进 1 像素，若按整方块做遮挡剔除，
+                            // 邻块朝它的那一面会被省掉，接缝处漏出一条看穿的缝。
+                            // noOcclusion 让邻块照常画面，缝隙由邻块贴图填上（同原版堆肥桶）。
+                            .noOcclusion()
                             .sound(net.minecraft.world.level.block.SoundType.WOOD)));
 
     public static final RegistryObject<Item> SMART_WORKBENCH_ITEM =

@@ -91,6 +91,12 @@ final class ChainFeasibility {
 
     /** 复核一份配方。同一实例可以连续调用，每次都会把账本还原到库存原值。 */
     Verdict check(CraftingRecipe recipe) {
+        // 预算用尽后也要先做一次「一眼假」判定。玩家报的「石头配方明明只能熔炉烧圆石，
+        // 却被列成可链式」就是这一类：熔炉配方压根不在工作台配方索引里，无论给多少预算
+        // 都补不出来。这条判定不递归、不花预算，所以预算见底时照样能如实剔除。
+        if (quicklyImpossible(recipe)) {
+            return Verdict.IMPOSSIBLE;
+        }
         if (this.exhausted) {
             return Verdict.UNKNOWN;
         }
@@ -109,6 +115,54 @@ final class ChainFeasibility {
         // 链式项的定义就是「直接材料不齐、要靠补做中间材料」：一次补做都没有，
         // 说明点击路径也会因为 autoCraftable 为空而失败，同样不该留在列表里。
         return ok && intermediate ? Verdict.OBTAINABLE : Verdict.IMPOSSIBLE;
+    }
+
+    /**
+     * 不递归的「一眼假」判定：只要有一种材料在账本里一个都没有，并且它的任何候选物品
+     * 都<b>没有工作台配方</b>能产出，这份配方就必然做不出来。
+     * <p>
+     * 专治「石头只能靠熔炉烧圆石」这类假链式项：烧炼、锻造、切石都不在
+     * {@link #byResult}（工作台配方索引）里，所以这类材料在这里会被直接判死，
+     * 而不是拖到预算耗尽后被统一保留成 {@link Verdict#UNKNOWN}。
+     * 判据只查一层、不看数量，因此是乐观的：算不出问题就放行，不会误删真能做的东西。
+     */
+    private boolean quicklyImpossible(CraftingRecipe recipe) {
+        for (Ingredient ingredient : recipe.getIngredients()) {
+            if (ingredient.isEmpty()) {
+                continue;
+            }
+            if (hasAvailable(ingredient) || hasAnyCraftingSource(ingredient)) {
+                continue;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /** 账本里这种材料还剩下至少一个吗（按物品匹配，不看 NBT）。 */
+    private boolean hasAvailable(Ingredient ingredient) {
+        for (ItemStack preview : ingredient.getItems()) {
+            if (!preview.isEmpty() && this.counts.getOrDefault(preview.getItem(), 0L) > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 这份材料的某个候选物品，有没有工作台配方能产出它（只查一层索引，不递归展开）。 */
+    private boolean hasAnyCraftingSource(Ingredient ingredient) {
+        for (ItemStack preview : ingredient.getItems()) {
+            if (preview.isEmpty()) {
+                continue;
+            }
+            for (CraftingRecipe producer : this.byResult.getOrDefault(preview.getItem(), List.of())) {
+                ItemStack result = producer.getResultItem(this.registries);
+                if (!result.isEmpty() && ItemStack.isSameItemSameTags(result, preview)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**

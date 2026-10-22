@@ -8,6 +8,8 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.NonNullList;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.Tag;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.Container;
 import net.minecraft.world.ContainerHelper;
@@ -26,6 +28,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 
 /**
@@ -37,10 +40,32 @@ public class SmartWorkbenchBlockEntity extends BlockEntity implements Container,
     public static final int GRID_SIZE = 9;
     /** 与原版一致：离开 64 格（8 格距离）自动关闭界面 */
     private static final double USE_DISTANCE_SQUARED = 64.0D;
+    private static final String ORIGINS_TAG = "GridOrigins";
+
+    /** 合成格里一件材料是从哪儿取来的。 */
+    public enum OriginKind {
+        /** 某台接入容器的某一格，原路插回这里。 */
+        STORAGE,
+        /** 玩家自己背包里的，退回玩家背包。 */
+        PLAYER,
+        /** 来自某个接入存储但记不住坐标（背包里的背包这种），优先塞回箱子。 */
+        ANY
+    }
+
+    /**
+     * 合成格里一件材料的来路。存在方块实体上，所以关掉界面、重开、甚至重启游戏之后
+     * 切换配方仍能原路退回，而不是一股脑塞进玩家背包。
+     */
+    public record GridOrigin(ItemStack stack, BlockPos pos, int slot, OriginKind kind) {
+    }
 
     private final NonNullList<ItemStack> items = NonNullList.withSize(GRID_SIZE, ItemStack.EMPTY);
+    /** 与合成格一一对应的材料来路，菜单负责维护。 */
+    private final List<List<GridOrigin>> gridOrigins = createOriginLists();
     /** 缓存的取料存储：绑定的在前，自动扫描的在后 */
     private List<IItemHandler> storages = List.of();
+    /** 与 {@link #storages} 一一对应的方块坐标；背包内部这类没有坐标的存储记 null。 */
+    private List<BlockPos> storagePositions = List.of();
     /** 缓存的输出容器：自动合成的产物优先送进这里 */
     private List<IItemHandler> outputStorages = List.of();
     /** 扳手手动绑定的「取料容器」坐标，不受扫描范围限制 */
@@ -140,6 +165,89 @@ public class SmartWorkbenchBlockEntity extends BlockEntity implements Container,
         return true;
     }
 
+    /* 材料来路 */
+
+    private static List<List<GridOrigin>> createOriginLists() {
+        List<List<GridOrigin>> lists = new ArrayList<>(GRID_SIZE);
+        for (int i = 0; i < GRID_SIZE; i++) {
+            lists.add(new ArrayList<>());
+        }
+        return lists;
+    }
+
+    /** 这一格的材料分别是从哪儿取的，按件的顺序。 */
+    public List<GridOrigin> getGridOrigins(int slot) {
+        if (slot < 0 || slot >= this.gridOrigins.size()) {
+            return List.of();
+        }
+        return List.copyOf(this.gridOrigins.get(slot));
+    }
+
+    /** 菜单同步过来：这一格的材料来路。内容没变就不标记存档，免得每 tick 都写脏。 */
+    public void setGridOrigins(int slot, List<GridOrigin> origins) {
+        if (slot < 0 || slot >= this.gridOrigins.size()) {
+            return;
+        }
+        List<GridOrigin> next = new ArrayList<>(origins.size());
+        for (GridOrigin origin : origins) {
+            if (origin != null && !origin.stack().isEmpty()) {
+                // 复制一份堆叠，菜单之后再怎么改自己的记录都影响不到存档里的这份
+                next.add(new GridOrigin(origin.stack().copy(), origin.pos(), origin.slot(), origin.kind()));
+            }
+        }
+        List<GridOrigin> current = this.gridOrigins.get(slot);
+        if (sameOrigins(current, next)) {
+            return;
+        }
+        current.clear();
+        current.addAll(next);
+        this.setChanged();
+    }
+
+    private static boolean sameOrigins(List<GridOrigin> first, List<GridOrigin> second) {
+        if (first.size() != second.size()) {
+            return false;
+        }
+        for (int i = 0; i < first.size(); i++) {
+            GridOrigin a = first.get(i);
+            GridOrigin b = second.get(i);
+            if (a.slot() != b.slot() || a.kind() != b.kind() || !Objects.equals(a.pos(), b.pos())
+                    || a.stack().getCount() != b.stack().getCount()
+                    || !ItemStack.isSameItemSameTags(a.stack(), b.stack())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** 这个取料处理器在世界上对应的方块坐标；背包内部这类没有坐标的返回 null。 */
+    public BlockPos storagePositionOf(IItemHandler handler) {
+        for (int i = 0; i < this.storages.size(); i++) {
+            if (this.storages.get(i) == handler) {
+                return i < this.storagePositions.size() ? this.storagePositions.get(i) : null;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 反查：这个坐标现在的取料处理器。
+     * <p>
+     * 存储列表每次重扫都会新建一批处理器包装对象，所以来路里不能存处理器本身，
+     * 只能存坐标，退料时再用坐标换回「现在」的那个处理器。
+     */
+    public IItemHandler handlerAt(BlockPos pos) {
+        if (pos == null) {
+            return null;
+        }
+        for (int i = 0; i < this.storagePositions.size() && i < this.storages.size(); i++) {
+            if (pos.equals(this.storagePositions.get(i))) {
+                return this.storages.get(i);
+            }
+        }
+        return null;
+    }
+
     /* MenuProvider */
 
     @Override
@@ -160,6 +268,7 @@ public class SmartWorkbenchBlockEntity extends BlockEntity implements Container,
         ContainerHelper.saveAllItems(tag, this.items);
         tag.putLongArray("Bindings", packPositions(this.manualBindings));
         tag.putLongArray("OutputBindings", packPositions(this.outputBindings));
+        tag.put(ORIGINS_TAG, saveOrigins());
     }
 
     @Override
@@ -173,6 +282,58 @@ public class SmartWorkbenchBlockEntity extends BlockEntity implements Container,
         this.outputBindings.clear();
         for (long packed : tag.getLongArray("OutputBindings")) {
             this.outputBindings.add(BlockPos.of(packed));
+        }
+        loadOrigins(tag.getList(ORIGINS_TAG, Tag.TAG_COMPOUND));
+    }
+
+    private ListTag saveOrigins() {
+        ListTag list = new ListTag();
+        for (int slot = 0; slot < this.gridOrigins.size(); slot++) {
+            for (GridOrigin origin : this.gridOrigins.get(slot)) {
+                if (origin.stack().isEmpty()) {
+                    continue;
+                }
+                CompoundTag entry = new CompoundTag();
+                entry.putByte("Slot", (byte) slot);
+                entry.put("Stack", origin.stack().save(new CompoundTag()));
+                if (origin.pos() != null) {
+                    entry.putLong("Pos", origin.pos().asLong());
+                    entry.putInt("ContainerSlot", origin.slot());
+                }
+                entry.putString("Kind", origin.kind().name());
+                list.add(entry);
+            }
+        }
+        return list;
+    }
+
+    private void loadOrigins(ListTag list) {
+        for (List<GridOrigin> perSlot : this.gridOrigins) {
+            perSlot.clear();
+        }
+        for (int i = 0; i < list.size(); i++) {
+            CompoundTag entry = list.getCompound(i);
+            int slot = entry.getByte("Slot");
+            if (slot < 0 || slot >= this.gridOrigins.size()) {
+                continue;
+            }
+            ItemStack stack = ItemStack.of(entry.getCompound("Stack"));
+            if (stack.isEmpty()) {
+                continue;
+            }
+            OriginKind kind;
+            try {
+                kind = OriginKind.valueOf(entry.getString("Kind"));
+            } catch (IllegalArgumentException unknown) {
+                kind = OriginKind.ANY;
+            }
+            BlockPos pos = entry.contains("Pos") ? BlockPos.of(entry.getLong("Pos")) : null;
+            int containerSlot = entry.contains("ContainerSlot") ? entry.getInt("ContainerSlot") : -1;
+            if (pos == null && kind == OriginKind.STORAGE) {
+                // 存档里来路不明：按「塞回接入存储」处理，总比塞玩家背包强
+                kind = OriginKind.ANY;
+            }
+            this.gridOrigins.get(slot).add(new GridOrigin(stack, pos, containerSlot, kind));
         }
     }
 
@@ -290,6 +451,8 @@ public class SmartWorkbenchBlockEntity extends BlockEntity implements Container,
 
         List<IItemHandler> inputs = new ArrayList<>();
         List<IItemHandler> outputs = new ArrayList<>();
+        // 与 inputs 同步增长：每台存储在世界里的坐标，用来支持「切换配方原路退回」
+        List<BlockPos> positions = new ArrayList<>();
 
         // 输出容器：只认手动绑定的，永远不参与合成取料
         Set<Long> output = new HashSet<>();
@@ -308,6 +471,7 @@ public class SmartWorkbenchBlockEntity extends BlockEntity implements Container,
             IItemHandler handler = findItemHandler(this.level, bound);
             if (handler != null && handler.getSlots() > 0 && !containsInventory(inputs, handler)) {
                 inputs.add(handler);
+                positions.add(bound.immutable());
             }
         }
 
@@ -329,7 +493,7 @@ public class SmartWorkbenchBlockEntity extends BlockEntity implements Container,
             }
             IItemHandler handler = findItemHandler(this.level, pos);
             if (handler != null && handler.getSlots() > 0) {
-                found.add(new Entry(handler, pos.distManhattan(this.worldPosition)));
+                found.add(new Entry(handler, pos.distManhattan(this.worldPosition), pos.immutable()));
             }
         }
         found.sort(Comparator.comparingInt(Entry::distance));
@@ -344,6 +508,7 @@ public class SmartWorkbenchBlockEntity extends BlockEntity implements Container,
                 continue;
             }
             inputs.add(entry.handler());
+            positions.add(entry.pos());
             added++;
         }
 
@@ -356,8 +521,14 @@ public class SmartWorkbenchBlockEntity extends BlockEntity implements Container,
         }
         backpacks.addPlayerBackpacks(this.level, this.worldPosition);
 
+        // 背包内部的处理器没有方块坐标，补齐 null 让 positions 与 inputs 等长
+        while (positions.size() < inputs.size()) {
+            positions.add(null);
+        }
+
         this.storages = inputs;
         this.outputStorages = outputs;
+        this.storagePositions = positions;
     }
 
     public List<IItemHandler> getStorages() {
@@ -429,6 +600,6 @@ public class SmartWorkbenchBlockEntity extends BlockEntity implements Container,
     }
 
     /** 只给合成格提供交互，不对外暴露能力，避免被漏斗之类白嫖。 */
-    private record Entry(IItemHandler handler, int distance) {
+    private record Entry(IItemHandler handler, int distance, BlockPos pos) {
     }
 }

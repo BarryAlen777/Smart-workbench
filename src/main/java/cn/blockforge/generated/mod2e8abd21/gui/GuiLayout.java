@@ -104,9 +104,15 @@ public final class GuiLayout {
 
     /* 自动补齐开关 */
     public static final int BTN_REFILL_X = 92;
-    public static final int BTN_REFILL_Y = 68;
+    public static final int BTN_REFILL_Y = 70;
     public static final int BTN_REFILL_WIDTH = 78;
     public static final int BTN_REFILL_HEIGHT = 13;
+
+    /* 清空合成格按钮 */
+    public static final int BTN_CLEAR_X = 27;
+    public static final int BTN_CLEAR_Y = 70;
+    public static final int BTN_CLEAR_WIDTH = 54;
+    public static final int BTN_CLEAR_HEIGHT = 13;
 
     /* 接入存储计数 */
     public static final int STORAGE_X = 182;
