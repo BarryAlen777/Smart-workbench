@@ -62,3 +62,7 @@ Alt + 左键点击物品，设置为自动合成目标，工作台会持续产�
 - 链式合成单次最多补做中间产物份数：默认256，4~4096
 - 链式规划节点上限：防止复杂配方炸服，默认200000，1000~20000000
 - 链式项目材料复核预算：0=关闭复核，默认100000，0~5000000
+
+## 🔗 相关链接
+- [MC百科](https://www.mcmod.cn/class/31235.html)
+- [CurseForge](https://www.curseforge.com/minecraft/mc-mods/smart-workbench)
