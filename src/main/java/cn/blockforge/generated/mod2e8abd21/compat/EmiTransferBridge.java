@@ -252,10 +252,29 @@ public final class EmiTransferBridge {
             if (menu == null) {
                 return Boolean.FALSE;
             }
-            // EMI 的可合成标记可能在存储快照更新前调用，不能用旧快照阻断真正的服务端请求。
-            return Boolean.TRUE;
+            // 快照还没到或被截断时，本地没有完整库存：不阻断，交给服务端裁决。
+            // 否则大仓库里明明有料，EMI 也会把配方标成不可合成。
+            if (!menu.hasClientStorageSnapshot() || menu.isClientStorageTruncated()) {
+                return Boolean.TRUE;
+            }
+            return missingFor(menu, args[0]).isEmpty();
         } catch (Throwable ignored) {
-            return Boolean.FALSE;
+            // 反射对不上时别把所有配方都判死，交给服务端
+            return Boolean.TRUE;
+        }
+    }
+
+    /** 客户端判断这份配方还缺哪些材料；拿不到完整快照时返回空（不阻断）。 */
+    private static List<Object> missingFor(SmartWorkbenchMenu menu, Object recipe) {
+        if (menu == null || recipe == null
+                || !menu.hasClientStorageSnapshot() || menu.isClientStorageTruncated()) {
+            return List.of();
+        }
+        try {
+            return findMissing(recipe,
+                    MaterialAvailability.collectAvailable(menu, Minecraft.getInstance().player));
+        } catch (Throwable ignored) {
+            return List.of();
         }
     }
 
@@ -286,7 +305,8 @@ public final class EmiTransferBridge {
         List<Object> result = new ArrayList<>();
         try {
             SmartWorkbenchMenu menu = args.length > 1 ? menuOf(args[1]) : null;
-            boolean craftable = menu != null;
+            // 和 canCraft 用同一套判断：真的缺料才显示提示，不能只因为「菜单对得上」就标可合成。
+            boolean craftable = menu != null && missingFor(menu, args[0]).isEmpty();
             if (!craftable) {
                 Component message = Component.translatableWithFallback(
                         "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough", "附近存储和背包材料不足");

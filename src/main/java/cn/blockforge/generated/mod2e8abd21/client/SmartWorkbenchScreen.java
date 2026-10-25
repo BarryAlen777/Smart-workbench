@@ -185,6 +185,12 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
     private boolean listHintDrawn;
     /** 是否正在按住右侧滚动条拖动列表。 */
     private boolean draggingScroll;
+    /**
+     * 客户端镜像服务端的「每 4 tick 最多处理一个重操作」冷却。
+     * 以前客户端在发包前就改了选中项、放了音效，但服务端会把 200ms 内的第二个包直接丢掉，
+     * 于是界面金边和合成格对不上。这里同步冷却，没轮到的点击干脆不改界面状态。
+     */
+    private long clientNextActionTick;
     /** 当前选中的配方（自动合成按钮 / 快捷键就作用于它）；null 表示还没选。按配方 id 记，列表过滤/折叠后也找得回来。 */
     private ResourceLocation selectedRecipe;
     /** 折叠按钮是否正被按住。 */
@@ -383,8 +389,12 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
 
         // 上移 1 像素：贴图在标题区下沿（y=26）有一条装饰横线，字贴太近会像被线切掉。
         // 标题按用户要求左移，右边整段让给搜索框（坐标都在 GuiLayout 里）。
-        drawCentred(graphics, label("gui." + SmartWorkbenchMod.MOD_ID + ".panel.craftable", "可合成"),
-                this.leftPos + GuiLayout.LIST_TITLE_X, this.topPos + GuiLayout.LIST_TITLE_Y - 1, TEXT_MAIN, false);
+        // 标题可用宽度只到搜索框左边缘，英文「Craftable」放不下时就等比缩小，不压到搜索框上。
+        drawCentredFitted(graphics, label("gui." + SmartWorkbenchMod.MOD_ID + ".panel.craftable", "可合成"),
+                this.leftPos + GuiLayout.LIST_TITLE_X, this.topPos + GuiLayout.LIST_TITLE_Y - 1, TEXT_MAIN,
+                // 标题居中在 LIST_TITLE_X，左右两边到面板边缘/搜索框的距离取小的一边
+                2 * Math.min(GuiLayout.LIST_TITLE_X - GuiLayout.PANEL_X,
+                        GuiLayout.SEARCH_X - GuiLayout.LIST_TITLE_X) - 2);
 
         // 搜索框画在背景层：它只占标题行，不和任何物品格重叠，不会挡东西
         if (this.searchBox != null) {
@@ -487,8 +497,10 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
                 .append(Component.translatableWithFallback(
                         "gui." + SmartWorkbenchMod.MOD_ID + ".panel.output", "  输出: "))
                 .append(String.valueOf(this.menu.getOutputCount()));
-        graphics.drawString(this.font, storageLine,
-                this.leftPos + GuiLayout.STORAGE_X, this.topPos + GuiLayout.STORAGE_Y, TEXT_DIM, false);
+        // 面板右下角可用宽度有限：英文「Storages: 6  Output: 1」可能超宽，按同一套规则收进去
+        drawLeftFitted(graphics, storageLine,
+                this.leftPos + GuiLayout.STORAGE_X, this.topPos + GuiLayout.STORAGE_Y, TEXT_DIM,
+                GuiLayout.PANEL_WIDTH - (GuiLayout.STORAGE_X - GuiLayout.PANEL_X) - 2);
 
     }
 
@@ -589,9 +601,11 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         int border = this.batchBox.isFocused() ? SELECT_COLOR : GuiLayout.LINE_SOFT_COLOR;
         graphics.fill(x - 1, y - 1, x + w + 1, y + h + 1, border);
         graphics.fill(x, y, x + w, y + h, SEARCH_BG);
-        graphics.drawString(this.font,
+        // 「批量数量 / Bulk qty」的可用宽度只到输入框左边，英文放不下就缩小，别压进输入框
+        drawLeftFitted(graphics,
                 label("gui." + SmartWorkbenchMod.MOD_ID + ".label.batch_count", "批量数量"),
-                this.leftPos + GuiLayout.BATCH_LABEL_X, this.topPos + GuiLayout.BATCH_LABEL_Y, TEXT_MAIN, false);
+                this.leftPos + GuiLayout.BATCH_LABEL_X, this.topPos + GuiLayout.BATCH_LABEL_Y, TEXT_MAIN,
+                GuiLayout.BATCH_INPUT_X - GuiLayout.BATCH_LABEL_X - 2);
         this.batchBox.render(graphics, mouseX, mouseY, partialTick);
     }
 
@@ -780,6 +794,9 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         // 列表项 = 批量合成点中的那一项。两条都做到材料用完为止，走同一套服务端安全管道。
         if (isHeldClickGesture(ModKeyMappings.BATCH_CRAFT, button)) {
             if (isPointInResultSlot(mouseX, mouseY)) {
+                if (!actionReady()) {
+                    return true;
+                }
                 playClickSound();
                 ModNetwork.sendToServer(new C2SCraftRequestPacket(this.menu.getBenchPos(),
                         null, false, true, parseBatchCount()));
@@ -787,6 +804,9 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
             }
             int batchIndex = cellIndexAt(mouseX, mouseY);
             if (batchIndex >= 0 && !this.display.get(batchIndex).header()) {
+                if (!actionReady()) {
+                    return true;
+                }
                 CraftableListView.Cell cell = this.display.get(batchIndex);
                 this.selectedRecipe = cell.entry().recipeId();
                 playClickSound();
@@ -800,18 +820,26 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         // 现在 Alt+左键点折叠头就落回普通左键，只展开/收起被点的那一类。
         if (isAutoCraftGesture(button)) {
             if (this.menu.getCarried().isEmpty() && isPointInResultSlot(mouseX, mouseY)) {
-                autoCraftGrid();
+                if (actionReady()) {
+                    autoCraftGrid();
+                }
                 return true;
             }
             int autoIndex = cellIndexAt(mouseX, mouseY);
             if (autoIndex >= 0) {
                 CraftableListView.Cell cell = this.display.get(autoIndex);
                 if (!cell.header()) {
-                    selectAndAutoCraft(cell);
+                    if (actionReady()) {
+                        selectAndAutoCraft(cell);
+                    }
                     return true;
                 }
-            } else {
-                autoCraftSelected();
+            } else if (isInsidePanel(mouseX, mouseY)) {
+                // 只吃面板里的点击：以前点背包格、点面板外空白也会触发自动合成，
+                // 而且这一下点击被吞掉、格子点不到。
+                if (actionReady()) {
+                    autoCraftSelected();
+                }
                 return true;
             }
         }
@@ -823,6 +851,9 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
             }
             if (isPointInButton(mouseX, mouseY)) {
                 this.refreshPressed = true;
+                if (!actionReady()) {
+                    return true;
+                }
                 playClickSound();
                 this.minecraft.gameMode.handleInventoryButtonClick(this.menu.containerId,
                         SmartWorkbenchMenu.BUTTON_REFRESH);
@@ -830,7 +861,9 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
             }
             if (isPointInAutoButton(mouseX, mouseY)) {
                 this.autoPressed = true;
-                autoCraftSelected();
+                if (actionReady()) {
+                    autoCraftSelected();
+                }
                 return true;
             }
             if (isPointInFoldButton(mouseX, mouseY)) {
@@ -839,6 +872,9 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
                 return true;
             }
             if (isPointInRefillButton(mouseX, mouseY)) {
+                if (!actionReady()) {
+                    return true;
+                }
                 this.minecraft.gameMode.handleInventoryButtonClick(this.menu.containerId,
                         SmartWorkbenchMenu.BUTTON_AUTO_REFILL);
                 playClickSound();
@@ -855,6 +891,9 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
                                 true);
                     }
                 } else {
+                    if (!actionReady()) {
+                        return true;
+                    }
                     this.minecraft.gameMode.handleInventoryButtonClick(this.menu.containerId,
                             SmartWorkbenchMenu.BUTTON_CLEAR_GRID);
                 }
@@ -871,6 +910,10 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
                 // Shift 点击 = 直接用存储或背包里的材料合成一次；普通点击 = 把材料配到合成格。
                 // 批量合成不在这里：它由上面的批量合成键独立处理，两个手势不再挤同一次点击。
                 // 不管哪种，都顺手把它记成"选中项"，供自动合成按钮/快捷键使用
+                if (!actionReady()) {
+                    // 服务端 4 tick 内只处理一个包；轮不到就别改选中项，免得金边指向被丢掉的配方
+                    return true;
+                }
                 this.selectedRecipe = cell.entry().recipeId();
                 playClickSound();
                 ModNetwork.sendToServer(new C2SCraftRequestPacket(this.menu.getBenchPos(), cell.entry().recipeId(),
@@ -881,20 +924,50 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
         return super.mouseClicked(mouseX, mouseY, button);
     }
 
+    /** 客户端冷却：和服务端 acceptAction 的「每 4 tick 一个重操作」保持一致。 */
+    private boolean actionReady() {
+        if (this.minecraft == null || this.minecraft.level == null) {
+            return true;
+        }
+        long now = this.minecraft.level.getGameTime();
+        if (now < this.clientNextActionTick) {
+            return false;
+        }
+        this.clientNextActionTick = now + 4L;
+        return true;
+    }
+
     /**
-     * 「按住某个键盘键 + 鼠标左键」的手势判定。
+     * 「按住某个键 + 鼠标点击」的手势判定。
      * <p>
      * 键取的是 {@link KeyMapping} 当前绑定的值——也就是玩家在游戏按键设置里自己配的那个键——
      * 每一下点击都实时查 GLFW 的按下状态，改绑之后立刻生效，不用重开游戏。
-     * 绑成键盘键才认；玩家把它清成"未绑定"时手势自然失效。
+     * <ul>
+     *   <li>绑成键盘键：按住该键 + 左键；</li>
+     *   <li>绑成鼠标键：按那个键本身就是手势（比如绑右键 = 右键直接触发），不再要求左键；</li>
+     *   <li>Forge 的修饰键（Ctrl/Shift/Alt）也要满足，否则玩家设的「Shift+E」会退化成裸 E。</li>
+     * </ul>
      */
     private boolean isHeldClickGesture(KeyMapping mapping, int button) {
-        if (button != GLFW.GLFW_MOUSE_BUTTON_LEFT || this.minecraft == null || this.minecraft.getWindow() == null) {
+        if (this.minecraft == null || this.minecraft.getWindow() == null || !modifierActive(mapping)) {
             return false;
         }
+        long window = this.minecraft.getWindow().getWindow();
         InputConstants.Key key = mapping.getKey();
-        return key.getType() == InputConstants.Type.KEYSYM
-                && InputConstants.isKeyDown(this.minecraft.getWindow().getWindow(), key.getValue());
+        if (key.getType() == InputConstants.Type.MOUSE) {
+            return key.getValue() >= 0 && button == key.getValue()
+                    && GLFW.glfwGetMouseButton(window, key.getValue()) == GLFW.GLFW_PRESS;
+        }
+        return button == GLFW.GLFW_MOUSE_BUTTON_LEFT
+                && key.getType() == InputConstants.Type.KEYSYM
+                && key.getValue() >= 0
+                && InputConstants.isKeyDown(window, key.getValue());
+    }
+
+    /** 玩家给按键绑的 Forge 修饰键此刻是否按着（NONE 表示没有额外要求）。 */
+    private static boolean modifierActive(KeyMapping mapping) {
+        KeyModifier modifier = mapping.getKeyModifier();
+        return modifier == KeyModifier.NONE || modifier.isActive(KeyConflictContext.GUI);
     }
 
     /**
@@ -905,10 +978,14 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
      */
     private String gestureKeyName(KeyMapping mapping) {
         InputConstants.Key key = mapping.getKey();
-        if (key.getType() != InputConstants.Type.KEYSYM || key.getValue() < 0) {
+        if (key.getValue() < 0) {
             return null;
         }
-        return key.getDisplayName().getString();
+        if (key.getType() == InputConstants.Type.KEYSYM) {
+            return key.getDisplayName().getString();
+        }
+        // 绑成鼠标键也要给提示，否则玩家改完键位后界面上完全看不出该怎么用。
+        return mapping.getTranslatedKeyMessage().getString();
     }
 
     /**
@@ -1103,6 +1180,16 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
 
     @Override
     public boolean mouseReleased(double mouseX, double mouseY, int button) {
+        // 文本框自己也要收到松开事件，否则它内部的拖动状态会一直挂着。
+        EditBox box = focusedTextBox();
+        if (box != null && box.mouseReleased(mouseX, mouseY, button)) {
+            this.refreshPressed = false;
+            this.autoPressed = false;
+            this.foldPressed = false;
+            this.clearPressed = false;
+            this.draggingScroll = false;
+            return true;
+        }
         // 松开鼠标就取消按钮和滚动条的按住状态。
         this.refreshPressed = false;
         this.autoPressed = false;
@@ -1119,7 +1206,23 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
             updateScrollFromMouse(mouseY);
             return true;
         }
+        // 文本框的拖动/选区事件以前没转发：在搜索框里拖选文字、拖动光标都没反应。
+        EditBox box = focusedTextBox();
+        if (box != null && box.mouseDragged(mouseX, mouseY, button, dragX, dragY)) {
+            return true;
+        }
         return super.mouseDragged(mouseX, mouseY, button, dragX, dragY);
+    }
+
+    /** 当前聚焦的文本框（搜索框优先）；都没聚焦返回 null。 */
+    private EditBox focusedTextBox() {
+        if (this.searchBox != null && this.searchBox.isFocused()) {
+            return this.searchBox;
+        }
+        if (this.batchBox != null && this.batchBox.isFocused()) {
+            return this.batchBox;
+        }
+        return null;
     }
 
     /** 原版按钮和配方书用的点击音效，给刷新按钮、列表项一个"点到了"的反馈。 */
@@ -1132,6 +1235,62 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
     /** 居中绘制文字；MC 自带的 drawCenteredString 没有阴影参数，只能自己算宽度。 */
     private void drawCentred(GuiGraphics graphics, Component text, int centerX, int y, int color, boolean shadow) {
         graphics.drawString(this.font, text, centerX - this.font.width(text) / 2, y, color, shadow);
+    }
+
+    /**
+     * 居中绘制，宽度超出上限时整体等比缩小（最低 0.5 倍）。
+     * <p>
+     * 按钮只有 30 像素宽，英文「Refresh」「Craftable」在默认字号下会顶出按钮/标题区；
+     * 中文没问题不代表英文没问题，换任何语言都按同一套规则收进去。
+     */
+    private void drawCentredFitted(GuiGraphics graphics, Component text, int centerX, int y,
+                                   int color, int maxWidth) {
+        int width = this.font.width(text);
+        if (maxWidth <= 0 || width <= maxWidth) {
+            drawCentred(graphics, text, centerX, y, color, false);
+            return;
+        }
+        if (width > maxWidth * 2) {
+            // 连 0.5 倍都放不下（德语/法语的长按钮名）：截断加省略号，别糊出按钮外
+            text = Component.literal(ellipsized(text.getString(), maxWidth));
+            width = this.font.width(text);
+        }
+        float scale = Math.max(0.5F, (float) maxWidth / (float) width);
+        float scaledWidth = width * scale;
+        graphics.pose().pushPose();
+        // 缩放后行高也变小，纵向补回一半，字仍然落在原来的行里
+        graphics.pose().translate(centerX - scaledWidth / 2.0F,
+                y + this.font.lineHeight * (1.0F - scale) / 2.0F, 0.0F);
+        graphics.pose().scale(scale, scale, 1.0F);
+        graphics.drawString(this.font, text, 0, 0, color, false);
+        graphics.pose().popPose();
+    }
+
+    /** 左对齐版本：用于固定坐标的标签，宽度超了就缩小，不往右边的输入框上压。 */
+    private void drawLeftFitted(GuiGraphics graphics, Component text, int x, int y,
+                                int color, int maxWidth) {
+        int width = this.font.width(text);
+        if (maxWidth <= 0 || width <= maxWidth) {
+            graphics.drawString(this.font, text, x, y, color, false);
+            return;
+        }
+        if (width > maxWidth * 2) {
+            text = Component.literal(ellipsized(text.getString(), maxWidth));
+            width = this.font.width(text);
+        }
+        float scale = Math.max(0.5F, (float) maxWidth / (float) width);
+        graphics.pose().pushPose();
+        graphics.pose().translate(x, y + this.font.lineHeight * (1.0F - scale) / 2.0F, 0.0F);
+        graphics.pose().scale(scale, scale, 1.0F);
+        graphics.drawString(this.font, text, 0, 0, color, false);
+        graphics.pose().popPose();
+    }
+
+    /** 按「0.5 倍仍放得下」的物理宽度截断，末尾补省略号。 */
+    private String ellipsized(String raw, int maxWidth) {
+        String dots = "...";
+        int budget = Math.max(1, maxWidth * 2 - this.font.width(dots));
+        return this.font.plainSubstrByWidth(raw, budget) + dots;
     }
 
     private void drawCentred(GuiGraphics graphics, FormattedCharSequence text, int centerX, int y,
@@ -1489,7 +1648,7 @@ public class SmartWorkbenchScreen extends AbstractContainerScreen<SmartWorkbench
             graphics.fill(px + 1, py + 1, px + w - 1, py + h - 1, down ? BUTTON_PRESSED : BUTTON_HOVER);
         }
         int textY = py + (h - this.font.lineHeight) / 2 + (down ? 1 : 0);
-        drawCentred(graphics, text, px + w / 2, textY, down ? TEXT_PRESSED : baseColor, false);
+        drawCentredFitted(graphics, text, px + w / 2, textY, down ? TEXT_PRESSED : baseColor, w - 3);
     }
 
     private boolean isInsidePanel(double mouseX, double mouseY) {

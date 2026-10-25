@@ -73,6 +73,11 @@ public class SmartWorkbenchBlockEntity extends BlockEntity implements Container,
     /** 扳手手动绑定的「输出容器」坐标，只收自动合成的产物，不参与取料 */
     private final List<BlockPos> outputBindings = new ArrayList<>();
     private long lastScanTick = Long.MIN_VALUE;
+    /**
+     * 最近一次打开界面的玩家。自动扫描只把「这一名玩家」身上的背包接进来，
+     * 不能把附近所有人的背包都当公共料源（多人服上等于谁站在旁边谁的东西就能被抽走）。
+     */
+    private java.util.UUID lastUserId;
 
     public SmartWorkbenchBlockEntity(BlockPos pos, BlockState state) {
         super(ModRegistries.SMART_WORKBENCH_ENTITY.get(), pos, state);
@@ -146,7 +151,12 @@ public class SmartWorkbenchBlockEntity extends BlockEntity implements Container,
     @Override
     public void clearContent() {
         if (!this.isEmpty()) {
-            this.items.clear();
+            // NonNullList.withSize 底层是定长列表：直接 clear() 要么抛
+            // UnsupportedOperationException，要么把列表缩成 0 格，之后任何 setItem 都会越界。
+            // 逐格写空值才是 Container 契约要求的做法。
+            for (int i = 0; i < this.items.size(); i++) {
+                this.items.set(i, ItemStack.EMPTY);
+            }
             this.setChanged();
         }
     }
@@ -428,6 +438,24 @@ public class SmartWorkbenchBlockEntity extends BlockEntity implements Container,
 
     /* 接入存储 */
 
+    /** 记下这次打开界面的玩家：只把他自己的背包接进来当料源。 */
+    public void setLastUser(Player player) {
+        this.lastUserId = player == null ? null : player.getUUID();
+    }
+
+    /** 把上次打开界面的玩家找回来；玩家下线或换了维度就当作没有，绝不扫其他人。 */
+    private Player resolveLastUser() {
+        if (this.lastUserId == null || !(this.level instanceof net.minecraft.server.level.ServerLevel serverLevel)) {
+            return null;
+        }
+        for (net.minecraft.server.level.ServerPlayer player : serverLevel.players()) {
+            if (player.getUUID().equals(this.lastUserId)) {
+                return player;
+            }
+        }
+        return null;
+    }
+
     /**
      * 重新整理接入的存储：
      * <ol>
@@ -519,7 +547,7 @@ public class SmartWorkbenchBlockEntity extends BlockEntity implements Container,
         for (int i = 0; i < containerCount; i++) {
             backpacks.scan(inputs.get(i));
         }
-        backpacks.addPlayerBackpacks(this.level, this.worldPosition);
+        backpacks.addPlayerBackpacks(this.level, this.worldPosition, resolveLastUser());
 
         // 背包内部的处理器没有方块坐标，补齐 null 让 positions 与 inputs 等长
         while (positions.size() < inputs.size()) {

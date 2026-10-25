@@ -15,6 +15,7 @@ import java.util.List;
  * <ul>
  *   <li>工作台自动扫描附近容器的范围（默认 5x5x5，最大 50x50x50）；</li>
  *   <li>读取玩家身上/物品栏里精妙背包的范围（默认 3x3x3，最大 50x50x50）；</li>
+ *   <li>是否连附近其他玩家的背包也一起读（默认关闭）；</li>
  *   <li>扳手手动绑定「取料容器」的上限（1~50）；</li>
  *   <li>扳手手动绑定「输出容器」的上限（1~50）；</li>
  *   <li>一次自动合成最多做多少个（默认 64，最大 12318）；</li>
@@ -41,14 +42,16 @@ public final class ModConfig {
     public static final int DEFAULT_LIST_SIZE = 8192;
 
     /**
-     * 1.5.x 及之前列表的默认上限。配置里写着这个数（或更小）说明是旧版本的默认值，
-     * 不是玩家自己调过的：旧默认值会把排在后面的配方整批截掉（例如搜不到樱花木活板门），
-     * 所以统一顶到 {@link #DEFAULT_LIST_SIZE}；玩家自己写的大数值照旧尊重。
+     * 1.5.x 及之前列表的默认上限。配置里<b>正好</b>写着这个数说明是旧版本的默认值、
+     * 玩家没改过：旧默认值会把排在后面的配方整批截掉（例如搜不到樱花木活板门），
+     * 所以顶到 {@link #DEFAULT_LIST_SIZE}。玩家自己调的小数值照旧尊重。
      */
-    private static final int LEGACY_LIST_LIMIT = 1024;
+    private static final int LEGACY_LIST_LIMIT_1024 = 1024;
+    private static final int LEGACY_LIST_LIMIT_384 = 384;
 
     public static final ForgeConfigSpec.IntValue SCAN_RANGE;
     public static final ForgeConfigSpec.IntValue PLAYER_BACKPACK_RANGE;
+    public static final ForgeConfigSpec.BooleanValue ALLOW_OTHER_PLAYER_BACKPACKS;
     public static final ForgeConfigSpec.IntValue MAX_STORAGES;
     public static final ForgeConfigSpec.IntValue MAX_INPUT_BINDINGS;
     public static final ForgeConfigSpec.IntValue MAX_OUTPUT_BINDINGS;
@@ -75,8 +78,15 @@ public final class ModConfig {
         PLAYER_BACKPACK_RANGE = builder
                 .comment("工作台读取「玩家身上/物品栏里的精妙背包」的范围，按立方体边长算：",
                         "3 表示 3x3x3（默认，玩家得站在工作台旁边），50 表示 50x50x50。",
-                        "只有落在这个范围里的玩家，他身上的背包才会被工作台取料。")
+                        "默认只读取「正在使用这台工作台的玩家」自己的背包；",
+                        "想让旁边的其他玩家也被当成料源，见下面的 allowOtherPlayerBackpacks。")
                 .defineInRange("playerBackpackRange", 3, 1, 50);
+        ALLOW_OTHER_PLAYER_BACKPACKS = builder
+                .comment("是否把范围内「其他玩家」身上/物品栏里的精妙背包也当成料源。默认关闭。",
+                        "关闭：只有正在使用这台工作台的玩家自己的背包能取料，多人服里别人站旁边不会被抽东西；",
+                        "打开：范围内其他玩家的精妙背包也会被取用，合成会真的拿走他们的物品。",
+                        "适合朋友一起玩的小服（让队友的背包当共享仓库），公开服请保持关闭。")
+                .define("allowOtherPlayerBackpacks", false);
         MAX_STORAGES = builder
                 .comment("自动扫描最多同时接入多少个容器，越界的部分会被忽略。")
                 .defineInRange("maxStorages", 6, 1, 24);
@@ -173,6 +183,11 @@ public final class ModConfig {
         return playerBackpackRange() / 2;
     }
 
+    /** 是否把范围内其他玩家的背包也当料源（默认 false，多人服保持关闭最稳妥）。 */
+    public static boolean allowOtherPlayerBackpacks() {
+        return Boolean.TRUE.equals(ALLOW_OTHER_PLAYER_BACKPACKS.get());
+    }
+
     public static int maxStorages() {
         return Math.max(1, MAX_STORAGES.get());
     }
@@ -226,9 +241,10 @@ public final class ModConfig {
 
     public static int maxListSize() {
         int configured = LIST_SLOTS.get();
-        // 旧版本默认的 1024（以及更早的 384）都是「没被玩家改过就白白截断列表」的遗留值，
-        // 统一顶到新默认值；玩家自己写的大数值照旧尊重。
-        int effective = configured <= LEGACY_LIST_LIMIT ? DEFAULT_LIST_SIZE : configured;
+        // 只认「旧版本默认值」这几个精确数字（1024、更早的 384）：那是玩家没改过配置留下的，
+        // 顶到新默认值。玩家自己写的小数值（比如 512）是他有意调的，必须照办。
+        boolean legacyDefault = configured == LEGACY_LIST_LIMIT_1024 || configured == LEGACY_LIST_LIMIT_384;
+        int effective = legacyDefault ? DEFAULT_LIST_SIZE : configured;
         return Math.max(12, Math.min(MAX_LIST_SIZE, effective));
     }
 

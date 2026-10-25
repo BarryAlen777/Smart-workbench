@@ -47,9 +47,12 @@ public class S2CCraftableListPacket {
     private final List<ItemStack> storageStacks;
     private final int storageCount;
     private final int outputCount;
+    /** 快照是不是因为超过上限被截断：截断时客户端不能拿它判缺料。 */
+    private final boolean storageTruncated;
 
     public S2CCraftableListPacket(BlockPos pos, List<CraftableEntry> entries, int chunkIndex, int chunkCount,
-                                  List<ItemStack> storageStacks, int storageCount, int outputCount) {
+                                  List<ItemStack> storageStacks, int storageCount, int outputCount,
+                                  boolean storageTruncated) {
         this.pos = pos;
         this.entries = List.copyOf(entries);
         this.chunkIndex = Math.max(0, chunkIndex);
@@ -57,6 +60,7 @@ public class S2CCraftableListPacket {
         this.storageStacks = List.copyOf(storageStacks);
         this.storageCount = Math.max(0, storageCount);
         this.outputCount = Math.max(0, outputCount);
+        this.storageTruncated = storageTruncated;
     }
 
     public S2CCraftableListPacket(FriendlyByteBuf buf) {
@@ -82,6 +86,7 @@ public class S2CCraftableListPacket {
         this.storageStacks = List.copyOf(storage);
         this.storageCount = buf.readVarInt();
         this.outputCount = buf.readVarInt();
+        this.storageTruncated = buf.readBoolean();
     }
 
     public void encode(FriendlyByteBuf buf) {
@@ -99,6 +104,7 @@ public class S2CCraftableListPacket {
         }
         buf.writeVarInt(this.storageCount);
         buf.writeVarInt(this.outputCount);
+        buf.writeBoolean(this.storageTruncated);
     }
 
     public void handle(Supplier<NetworkEvent.Context> contextSupplier) {
@@ -109,7 +115,7 @@ public class S2CCraftableListPacket {
                     && menu.getBenchPos().equals(this.pos)) {
                 if (this.chunkIndex == 0) {
                     // 存储快照只在第一块里，客户端收到就立刻给 REI 用上
-                    menu.setClientStorageStacks(this.storageStacks);
+                    menu.setClientStorageStacks(this.storageStacks, this.storageTruncated);
                     menu.setClientConnectedStorageCount(this.storageCount);
                     menu.setClientOutputCount(this.outputCount);
                 }

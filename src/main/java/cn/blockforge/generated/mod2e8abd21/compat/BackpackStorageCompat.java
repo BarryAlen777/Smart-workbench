@@ -25,7 +25,9 @@ import java.util.Set;
  * 漏斗/管道都是这么取料的）。所以这里一个精妙背包的类都不用 import，只查这个通用能力：
  * <ul>
  *   <li>接入的容器（箱子、精妙存储抽屉等）里放着的背包，把它的内部库存也接进来；</li>
- *   <li>工作台一定范围内玩家身上（装备格、主背包、快捷栏、Curios 饰品栏）的背包同样接进来。</li>
+ *   <li>正在使用这台工作台的玩家身上（装备格、主背包、快捷栏、Curios 饰品栏）的背包同样接进来；
+ *       默认只接这一名玩家；把配置 {@code storage.allowOtherPlayerBackpacks} 打开后，
+ *       同一范围内其他玩家的背包也会接进来（默认关闭，公开服保持关闭）。</li>
  * </ul>
  * 没装精妙背包时这些查询全部落空，等于什么都没做，不会影响原来的功能。
  */
@@ -64,17 +66,30 @@ public final class BackpackStorageCompat {
     }
 
     /**
-     * 接工作台附近的玩家身上/物品栏里的背包。
+     * 接「打开工作台的那名玩家」身上/物品栏里的背包。
      * 范围由配置 {@code storage.playerBackpackRange} 控制（默认 3 即 3x3x3，最大 50）。
+     * <p>
+     * <b>默认只扫 owner 一个人。</b>早前这里无条件扫范围内所有玩家，多人服上站在旁边的人
+     * 就能让工作台把自己的背包当公共料源抽走——这是物品归属问题，不是便利性功能。
+     * owner 为 null（方块实体不知道谁在用）时默认一个都不扫，宁可少接也不越权。
+     * <p>
+     * 配置 {@code storage.allowOtherPlayerBackpacks} 打开后，同一范围内其他玩家的背包
+     * 也会被接进来（合成会真的从他们身上取料），适合朋友一起玩的小服；默认关闭。
      */
-    public int addPlayerBackpacks(Level level, BlockPos benchPos) {
+    public int addPlayerBackpacks(Level level, BlockPos benchPos, Player owner) {
+        if (owner == null && !ModConfig.allowOtherPlayerBackpacks()) {
+            return this.added;
+        }
+        if (this.added >= this.limit) {
+            return this.added;
+        }
         int radius = ModConfig.playerBackpackRadius();
         AABB area = new AABB(benchPos).inflate(radius);
-        for (Player player : level.getEntitiesOfClass(Player.class, area)) {
-            if (this.added >= this.limit) {
-                break;
-            }
-            scanPlayerInventory(player);
+        if (owner != null && area.contains(owner.getX(), owner.getY(), owner.getZ())) {
+            scanPlayerInventory(owner);
+        }
+        if (ModConfig.allowOtherPlayerBackpacks()) {
+            scanOtherPlayers(level, area, owner);
         }
         return this.added;
     }
@@ -123,6 +138,30 @@ public final class BackpackStorageCompat {
         scanCurios(player);
     }
 
+    /**
+     * 把范围内「其他玩家」的背包也接进来。
+     * <p>
+     * 只有配置 {@code storage.allowOtherPlayerBackpacks} 打开时才会走到这里；默认关闭，
+     * 此时这个方法根本不会被调用。同一名玩家只按 UUID 认一次，owner 自己不会重复扫描。
+     */
+    private void scanOtherPlayers(Level level, AABB area, Player owner) {
+        for (Player player : level.players()) {
+            if (this.added >= this.limit) {
+                return;
+            }
+            if (player == null || player == owner) {
+                continue;
+            }
+            if (owner != null && player.getUUID().equals(owner.getUUID())) {
+                continue;
+            }
+            if (!area.contains(player.getX(), player.getY(), player.getZ())) {
+                continue;
+            }
+            scanPlayerInventory(player);
+        }
+    }
+
     private void scanStackList(List<ItemStack> stacks) {
         for (ItemStack stack : stacks) {
             if (this.added >= this.limit) {
@@ -147,7 +186,13 @@ public final class BackpackStorageCompat {
             if (curios == null) {
                 return;
             }
-            IItemHandler equipped = asItemHandler(invoke(curios, "getEquippedCurios"));
+            // 有些 Curios 版本 getEquippedCurios 返回 LazyOptional，有些直接返回 IItemHandler；
+            // 两种都认，否则饰品栏里的背包会整批漏掉。
+            Object equippedValue = invoke(curios, "getEquippedCurios");
+            if (equippedValue instanceof LazyOptional<?> lazy) {
+                equippedValue = lazy.orElse(null);
+            }
+            IItemHandler equipped = asItemHandler(equippedValue);
             if (equipped != null) {
                 scanInto(equipped, MAX_DEPTH);
                 return;

@@ -3,6 +3,8 @@ package cn.blockforge.generated.mod2e8abd21.client;
 import cn.blockforge.generated.mod2e8abd21.SmartWorkbenchMod;
 import net.minecraft.client.Minecraft;
 import net.minecraft.resources.ResourceLocation;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
 import java.io.InputStream;
@@ -25,9 +27,12 @@ import java.util.zip.GZIPInputStream;
 public final class PinyinTable {
 
     private static final String RESOURCE = "/assets/smart_workbench/pinyin.tsv.gz";
+    private static final Logger LOGGER = LoggerFactory.getLogger("SmartWorkbench");
 
     private static Map<Character, String> table;
     private static boolean loaded;
+    /** 失败日志只打一次；表还是会重试，避免第一下搜索恰好赶在资源加载前就整局放弃。 */
+    private static boolean failureLogged;
 
     private PinyinTable() {
     }
@@ -42,8 +47,18 @@ public final class PinyinTable {
         if (loaded) {
             return;
         }
+        // 成功之后才置位：读失败下次还能重试（旧写法先置 true，一次失败整局都不再读）。
+        Map<Character, String> loadedTable = load();
+        if (loadedTable == null) {
+            if (!failureLogged) {
+                failureLogged = true;
+                LOGGER.warn("Pinyin table {} is missing or broken; pinyin search is disabled for this session.",
+                        RESOURCE);
+            }
+            return;
+        }
+        table = loadedTable;
         loaded = true;
-        table = load();
     }
 
     private static Map<Character, String> load() {
@@ -66,7 +81,13 @@ public final class PinyinTable {
                     if (tab <= 0) {
                         continue;
                     }
-                    int codePoint = Integer.parseInt(line.substring(0, tab), 16);
+                    int codePoint;
+                    try {
+                        codePoint = Integer.parseInt(line.substring(0, tab), 16);
+                    } catch (NumberFormatException bad) {
+                        // 一行坏数据只丢这一行，别让整张表变成 null、把拼音搜索全废掉
+                        continue;
+                    }
                     // 多音字按空格分隔，只取最常用的一读，避免搜索词命中冷门读音
                     String readings = line.substring(tab + 1).trim();
                     int space = readings.indexOf(' ');

@@ -1,6 +1,7 @@
 package cn.blockforge.generated.mod2e8abd21.menu;
 
 import net.minecraft.core.NonNullList;
+import net.minecraft.nbt.CompoundTag;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.crafting.Ingredient;
@@ -99,6 +100,32 @@ public final class StoragePool {
                 continue;
             }
             long h = stack.getCount();
+            h = h * 31L + stack.getItem().getDescriptionId().hashCode();
+            if (stack.getTag() != null) {
+                h = h * 31L + stack.getTag().hashCode();
+            }
+            hash ^= h;
+            hash *= 0x100000001b3L;
+        }
+        return hash;
+    }
+
+    /**
+     * 比 {@link #fingerprint()} 更便宜、也更“钝”的指纹：只看物品种类和每格最多 9 个，
+     * 忽略大数量的来回波动（箱子被漏斗抽走几个、农场往里塞几个）。
+     * <p>
+     * 可合成列表只回答「这份配方能不能做一次」，而一次合成最多用到 9 个同种材料，
+     * 所以把每格数量夹到 9 之后，指纹没变就代表列表结果不会变——大整合包里
+     * 库存数量每秒变一次时，不必把上万份配方重新 plan 一遍。
+     */
+    public long listFingerprint() {
+        long hash = 0xcbf29ce484222325L;
+        for (int i = 0; i < this.size; i++) {
+            ItemStack stack = this.stacks[i];
+            if (stack.isEmpty()) {
+                continue;
+            }
+            long h = Math.min(stack.getCount(), 9);
             h = h * 31L + stack.getItem().getDescriptionId().hashCode();
             if (stack.getTag() != null) {
                 h = h * 31L + stack.getTag().hashCode();
@@ -312,29 +339,64 @@ public final class StoragePool {
      * 只读不消耗，数量取 collect 时的原值。REI 靠它判断「箱子里的材料够不够」。
      */
     public List<ItemStack> mergeForClient(int limit) {
+        return mergeForClientSnapshot(limit).stacks();
+    }
+
+    /** 快照，以及「是否因为超过 limit 被截断」——截断时客户端不能把「缺料」当真。 */
+    public record ClientSnapshot(List<ItemStack> stacks, boolean truncated) {
+    }
+
+    /**
+     * 带截断标记的快照。超过 limit 种物品时列表是不完整的，客户端拿到后
+     * 必须降级为「不阻断、交给服务端裁决」，否则大仓库会误报缺料。
+     */
+    public ClientSnapshot mergeForClientSnapshot(int limit) {
         List<ItemStack> merged = new ArrayList<>();
+        boolean truncated = false;
+        // 按「物品 + NBT」分桶，别拿每种新物品去和已合并的列表逐个比：
+        // 大仓库一次快照有几千个槽位，原来的 O(n²) 在每次刷新时都要跑一遍。
+        Map<Item, Map<CompoundTag, ItemStack>> buckets = new HashMap<>();
         for (int i = 0; i < this.size; i++) {
             ItemStack stack = this.stacks[i];
             if (stack.isEmpty()) {
                 continue;
             }
-            ItemStack accumulated = null;
-            for (ItemStack candidate : merged) {
-                if (ItemStack.isSameItemSameTags(candidate, stack)) {
-                    accumulated = candidate;
-                    break;
-                }
-            }
+            Map<CompoundTag, ItemStack> byTag =
+                    buckets.computeIfAbsent(stack.getItem(), k -> new HashMap<>());
+            ItemStack accumulated = byTag.get(stack.getTag());
             if (accumulated == null) {
                 if (merged.size() >= limit) {
+                    truncated = true;
                     continue;
                 }
-                merged.add(stack.copy());
+                ItemStack copy = stack.copy();
+                merged.add(copy);
+                byTag.put(copy.getTag(), copy);
             } else {
                 long total = (long) accumulated.getCount() + stack.getCount();
                 accumulated.setCount((int) Math.min(Integer.MAX_VALUE, total));
             }
         }
-        return merged;
+        return new ClientSnapshot(merged, truncated);
+    }
+
+    /**
+     * 批量合成每轮都要知道「箱子里现在还剩多少」。整份重新 collect 会反复分配列表和索引，
+     * 上千轮下来 GC 抖动明显；这里直接回读每个已知格子的当前数量（同一个同步包内
+     * 世界不会 tick，只有我们自己抽走的材料会变）。
+     * <p>
+     * 如果某个格子的物品被换掉了（个别模组的包装器会替换 ItemStack），返回 false，
+     * 调用方退回完整的 {@link #collect(List)}，宁可多扫一次也不拿错库存。
+     */
+    public boolean refreshCounts() {
+        for (int i = 0; i < this.size; i++) {
+            ItemStack live = this.handlers.get(this.handlerIndex[i]).getStackInSlot(this.slotIndex[i]);
+            if (live.isEmpty() || !ItemStack.isSameItemSameTags(live, this.stacks[i])) {
+                return false;
+            }
+            this.stacks[i] = live;
+            this.available[i] = live.getCount();
+        }
+        return true;
     }
 }

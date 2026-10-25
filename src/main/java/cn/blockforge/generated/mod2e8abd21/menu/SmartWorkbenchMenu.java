@@ -153,6 +153,12 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     /** 合成格中由存储取来的材料来源；切换配方时优先退回原槽位。 */
     private final List<SourcePart>[] matrixSources = createSourceLists();
     private boolean updatingMatrix;
+    /**
+     * 正在整批摆料。摆一份配方要往 9 个格子里写，每写一格都会触发 slotsChanged → updateResult →
+     * 原版 getRecipeFor（O(配方数) 线性扫描）；大整合包里一次点击就是 9 次全表扫描。
+     * 摆料期间先挂起结果重算，摆完由调用方统一算一次。
+     */
+    private boolean fillingGrid;
     /** 合成格的来路有没有变动；变动后找机会抄给方块实体，关掉界面也能记住。 */
     private boolean originsDirty = true;
 
@@ -230,6 +236,8 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     private List<ItemStack> clientStorageStacks = List.of();
     /** 客户端是否已经收到过服务器推来的存储快照；没收到时缺料判断不可信。 */
     private boolean clientStorageSynced;
+    /** 快照是否因为超过 512 种被截断；截断时客户端不能把「缺料」当真。 */
+    private boolean clientStorageTruncated;
     /** 客户端显示用；服务端的真实数量仍从方块实体读取。 */
     private int clientConnectedStorageCount;
     /** 客户端显示用：绑定的输出容器数量。 */
@@ -237,6 +245,13 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     /** 上次扫描时的库存指纹（含配方版本、输出容器数）。没变就跳过重算，省下大整合包里每秒几千次配方匹配。 */
     private long craftableFingerprint;
     private boolean hasCraftableFingerprint;
+    /**
+     * 可合成列表的“轻量”指纹：种类 + 每格最多 9 个 + 配方索引版本。
+     * 和它一样时直接复用上一份列表，只把新的库存快照发给客户端，
+     * 避免漏斗/农场导致数量抖动时每秒重扫全部配方。
+     */
+    private long craftableListFingerprint;
+    private boolean hasCraftableListFingerprint;
     /** 分块收列表用的缓冲：最后一块到了才整体换上，界面不会显示到一半的半截列表。 */
     private final List<CraftableEntry> clientCraftableBuffer = new ArrayList<>();
     private String storageInputSignature = "";
@@ -252,6 +267,15 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     /** 所有客户端操作共用一个服务端冷却，防止连点堆积主线程任务。 */
     private long nextActionTick;
     private CraftFeedback activeFeedback;
+    /**
+     * 手里那份 {@link StoragePool} 已经不可信：批量/链式合成期间往箱子里塞过东西
+     * （中间产物、剩余材料），而 {@link StoragePool#refreshCounts()} 只会回读「收集时就有东西」
+     * 的那些格子——原本空着、刚被塞进中间产物的格子它永远看不到。
+     * <p>
+     * 后果不是报错而是「算错账」：箱里明明有木板却报缺基础材料提前停下，
+     * 或者反过来把木材当成不够、多消耗基础材料。置位后下一轮强制整份重扫一次。
+     */
+    private boolean poolStale;
     /**
      * 玩家在本界面明确选过的配方（点列表 / REI 取料）。
      * 同一件产物可能有好几个模组的配方都能匹配，没装多态合成时就靠它保证产物格
@@ -328,6 +352,10 @@ public class SmartWorkbenchMenu extends CraftingMenu {
                 this.autoRefillEnabled = data.getBoolean(AUTO_REFILL_TAG);
             }
             if (this.bench != null) {
+                // 先把「谁在用这台工作台」记下来：默认自动扫描只接这名玩家自己的背包，
+                // 不把附近其他玩家的背包当公共料源（多人服上的物品归属问题）；
+                // 只有在配置里明确打开 allowOtherPlayerBackpacks 时才会连其他玩家一起读。
+                this.bench.setLastUser(this.player);
                 // 先把取料容器扫出来，再把上次摆的料「是从哪台箱子第几格拿的」接回来，
                 // 这样关掉界面再打开、切换配方时还是原路退回，不会全塞进玩家背包。
                 this.bench.refreshStorages(true);
@@ -441,8 +469,9 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     }
 
     /** 服务器推来的接入存储快照（同类已合并），REI 的缺料判断会用到。 */
-    public void setClientStorageStacks(List<ItemStack> stacks) {
+    public void setClientStorageStacks(List<ItemStack> stacks, boolean truncated) {
         this.clientStorageStacks = stacks;
+        this.clientStorageTruncated = truncated;
         this.clientStorageSynced = true;
     }
 
@@ -453,6 +482,11 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     /** 客户端有没有拿到过这份存储快照。没拿到之前，「缺料」的结论是不准的。 */
     public boolean hasClientStorageSnapshot() {
         return this.clientStorageSynced;
+    }
+
+    /** 快照有没有被截断。截断时客户端的「缺料」判断必须降级放行，交给服务端裁决。 */
+    public boolean isClientStorageTruncated() {
+        return this.clientStorageTruncated;
     }
 
     /**
@@ -722,6 +756,9 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             kind = SmartWorkbenchBlockEntity.OriginKind.ANY;
         }
         if (kind == SmartWorkbenchBlockEntity.OriginKind.ANY) {
+            // 退进「随便哪台接入存储」时可能落进原本空着的格子，
+            // 批量合成手里的库存快照就漏了这批材料，下一轮必须整份重扫。
+            this.poolStale = true;
             stack = insertIntoStorages(this.bench == null ? List.of() : this.bench.getStorages(), stack);
         }
         if (!stack.isEmpty() && !player.getInventory().add(stack)) {
@@ -847,6 +884,9 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         if (this.bench == null) {
             return 0;
         }
+        // 整批摆料期间挂起 slotsChanged 的结果重算，摆完由调用方统一 updateResult() 一次。
+        this.fillingGrid = true;
+        try {
         NonNullList<Ingredient> ingredients = recipe.getIngredients();
         int[] layout = gridLayout(recipe, ingredients);
         // wanted[格子] = 这个格子应该放第几个材料（-1 表示这格不该有东西）
@@ -882,7 +922,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
 
         // 2) 缺的从接入的存储里补；工作台已有材料优先，真正多出来的最后才退回原容器。
         this.bench.refreshStorages(true);
-        StoragePool pool = StoragePool.collect(inputHandlers());
+        StoragePool pool = collectInputPool();
         int pulled = 0;
         ForgeHooks.setCraftingPlayer(player);
         try {
@@ -957,6 +997,9 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         syncOriginsToBench();
         this.originsDirty = false;
         return pulled;
+        } finally {
+            this.fillingGrid = false;
+        }
     }
 
     /** 从链式补做得到的中间产物里拿出一件符合材料条件的物品。 */
@@ -1012,7 +1055,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
 
     @Override
     public void slotsChanged(Container container) {
-        if (!this.level.isClientSide) {
+        if (!this.level.isClientSide && !this.fillingGrid) {
             updateResult();
         }
     }
@@ -1100,14 +1143,25 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     private CraftingRecipe pickGridRecipe() {
         Optional<CraftingRecipe> polymorph =
                 PolymorphCompat.pickRecipe(this, RecipeType.CRAFTING, this.matrix, this.level, this.player);
-        if (polymorph.isPresent()) {
+        // 多态合成可能还记着上一份配方；材料换过之后它不一定还匹配。不匹配就往下走，
+        // 否则产物格会按旧配方 assemble 出一个当前材料根本做不出来的东西。
+        if (polymorph.isPresent() && matchesGrid(polymorph.get())) {
             return polymorph.get();
         }
-        if (this.preferredRecipe != null && this.preferredRecipe.matches(this.matrix, this.level)) {
+        if (this.preferredRecipe != null && matchesGrid(this.preferredRecipe)) {
             return this.preferredRecipe;
         }
         return this.level.getRecipeManager()
                 .getRecipeFor(RecipeType.CRAFTING, this.matrix, this.level).orElse(null);
+    }
+
+    /** 配方是否匹配当前合成格；第三方配方 matches 抛异常时当作不匹配，别把整个界面带崩。 */
+    private boolean matchesGrid(CraftingRecipe recipe) {
+        try {
+            return recipe.matches(this.matrix, this.level);
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     /** 记下玩家明确选的配方，并同步给多态合成，保证产物格显示的正是这一份。 */
@@ -1485,9 +1539,11 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         StoragePool pool = StoragePool.collect(scanHandlers());
         // 推给客户端的快照仍然只抄接入存储：玩家背包在客户端本来就能实时读到，
         // 把它塞进快照反而会慢一拍，让 REI 误判成缺料或多料。
-        List<ItemStack> storageSnapshot = storages.isEmpty()
-                ? List.of()
-                : StoragePool.collect(storages).mergeForClient(STORAGE_SNAPSHOT_LIMIT);
+        // 快照同时带回「有没有被 512 种上限截断」：截断时客户端必须放行，不能误报缺料。
+        StoragePool.ClientSnapshot snapshot = storages.isEmpty()
+                ? new StoragePool.ClientSnapshot(List.of(), false)
+                : StoragePool.collect(storages).mergeForClientSnapshot(STORAGE_SNAPSHOT_LIMIT);
+        List<ItemStack> storageSnapshot = snapshot.stacks();
         // 数据包重载会换掉配方索引，先让它把版本号刷新，再和库存一起算指纹
         List<CraftingRecipe> recipes = getPlainRecipes();
         long fingerprint = craftableFingerprint(pool, storageSnapshot, storages.size(), getOutputCount());
@@ -1498,45 +1554,60 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         this.craftableFingerprint = fingerprint;
         this.hasCraftableFingerprint = true;
 
-        List<CraftableEntry> next = new ArrayList<>();
-        if (!pool.isEmpty()) {
-            // 上限只用来兜住极端整合包；正常情况下直接项和链式项都会尽量列全。
-            int max = ModConfig.maxListSize();
-            Set<ResourceLocation> directIds = new HashSet<>();
-            // 直接项做出来的是什么，也要喂给链式闭包：像「钻石块 -> 9 钻石 -> 钻石剑」，
-            // 中间那步本身是直接项，产物不进可达集合的话，后续链子就断了。
-            Set<Item> directOutputs = new HashSet<>();
-            for (CraftingRecipe recipe : recipes) {
-                if (next.size() >= max) {
-                    break;
-                }
-                NonNullList<Ingredient> ingredients = recipe.getIngredients();
-                pool.reset();
-                boolean possible = true;
-                for (Ingredient ingredient : ingredients) {
-                    if (!pool.mayContain(ingredient)) {
-                        possible = false;
+        // 列表结果只取决于「有哪些种类、每种够不够做一次」和配方索引版本，
+        // 大数量抖动（漏斗抽走几块、农场塞进几根）不影响列表，直接复用上一份。
+        long listPrint = pool.listFingerprint();
+        listPrint = listPrint * 31L + this.recipeIndexVersion;
+        listPrint = listPrint * 31L + ModConfig.maxListSize();
+        boolean reuseList = this.hasCraftableListFingerprint && listPrint == this.craftableListFingerprint;
+        this.craftableListFingerprint = listPrint;
+        this.hasCraftableListFingerprint = true;
+
+        List<CraftableEntry> next;
+        if (reuseList) {
+            next = this.craftables;
+        } else {
+            next = new ArrayList<>();
+            if (!pool.isEmpty()) {
+                // 上限只用来兜住极端整合包；正常情况下直接项和链式项都会尽量列全。
+                int max = ModConfig.maxListSize();
+                Set<ResourceLocation> directIds = new HashSet<>();
+                // 直接项做出来的是什么，也要喂给链式闭包：像「钻石块 -> 9 钻石 -> 钻石剑」，
+                // 中间那步本身是直接项，产物不进可达集合的话，后续链子就断了。
+                Set<Item> directOutputs = new HashSet<>();
+                for (CraftingRecipe recipe : recipes) {
+                    if (next.size() >= max) {
                         break;
                     }
+                    NonNullList<Ingredient> ingredients = recipe.getIngredients();
+                    pool.reset();
+                    boolean possible = true;
+                    for (Ingredient ingredient : ingredients) {
+                        if (!pool.mayContain(ingredient)) {
+                            possible = false;
+                            break;
+                        }
+                    }
+                    boolean direct = possible && pool.plan(ingredients) != null;
+                    if (!direct) {
+                        continue;
+                    }
+                    ItemStack result = recipe.getResultItem(this.level.registryAccess());
+                    if (!result.isEmpty()) {
+                        next.add(CraftableEntry.of(recipe.getId(), result.copy(), false));
+                        directIds.add(recipe.getId());
+                        directOutputs.add(result.getItem());
+                    }
                 }
-                boolean direct = possible && pool.plan(ingredients) != null;
-                if (!direct) {
-                    continue;
-                }
-                ItemStack result = recipe.getResultItem(this.level.registryAccess());
-                if (!result.isEmpty()) {
-                    next.add(CraftableEntry.of(recipe.getId(), result.copy(), false));
-                    directIds.add(recipe.getId());
-                    directOutputs.add(result.getItem());
-                }
+                next.sort(Comparator.comparing(entry -> entry.result().getItem().getDescriptionId()));
+                next.addAll(collectChainEntries(pool, directIds, directOutputs, max - next.size()));
+                next = dedupeByResult(next);
             }
-            next.sort(Comparator.comparing(entry -> entry.result().getItem().getDescriptionId()));
-            next.addAll(collectChainEntries(pool, directIds, directOutputs, max - next.size()));
-            next = dedupeByResult(next);
         }
         this.craftables = next;
         if (this.player instanceof ServerPlayer serverPlayer) {
-            sendCraftableList(serverPlayer, next, storageSnapshot, storages.size(), getOutputCount());
+            sendCraftableList(serverPlayer, next, storageSnapshot, storages.size(), getOutputCount(),
+                    snapshot.truncated());
         }
     }
 
@@ -1700,7 +1771,8 @@ public class SmartWorkbenchMenu extends CraftingMenu {
      * 客户端累加到「最后一块」才整体换上，避开网络帧 1MB 的硬上限。
      */
     private void sendCraftableList(ServerPlayer player, List<CraftableEntry> entries,
-                                   List<ItemStack> snapshot, int storageCount, int outputCount) {
+                                   List<ItemStack> snapshot, int storageCount, int outputCount,
+                                   boolean snapshotTruncated) {
         int chunkSize = S2CCraftableListPacket.CHUNK_SIZE;
         int chunkCount = Math.max(1, (entries.size() + chunkSize - 1) / chunkSize);
         for (int index = 0; index < chunkCount; index++) {
@@ -1708,7 +1780,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             int to = Math.min(entries.size(), from + chunkSize);
             List<CraftableEntry> chunk = List.copyOf(entries.subList(from, to));
             ModNetwork.sendToPlayer(player, new S2CCraftableListPacket(this.benchPos, chunk, index, chunkCount,
-                    index == 0 ? snapshot : List.of(), storageCount, outputCount));
+                    index == 0 ? snapshot : List.of(), storageCount, outputCount, snapshotTruncated));
         }
     }
 
@@ -1740,6 +1812,12 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         }
         NonNullList<Ingredient> ingredients = recipe.getIngredients();
         if (ingredients.isEmpty()) {
+            return false;
+        }
+        // 材料表比 3x3 的格子还多：畸形配方（个别模组的 IShapedRecipe 尺寸和材料表对不上）
+        // 会让 gridLayout 回退成「依次摆」，多出来的材料被夹到最后一格——前面取出的那份
+        // 还没进格子就被覆盖，等于白吞玩家的材料。这种配方直接不接一键取料。
+        if (ingredients.size() > COLUMNS * ROWS) {
             return false;
         }
         int width = recipeWidth(recipe);
@@ -1833,7 +1911,10 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         int width = recipeWidth(recipe);
         int height = recipeHeight(recipe, width, ingredients.size());
         boolean shaped = recipe instanceof ShapedRecipe || recipe instanceof IShapedRecipe<?>;
-        if (!shaped || width <= 0 || height <= 0 || width > COLUMNS || height > ROWS) {
+        // 第三方 IShapedRecipe 的 getIngredients().size() 可能和 width*height 对不上；
+        // 这种畸形配方按形状摆会算到 3x3 外面（IndexOutOfBounds），直接退回“依次摆”。
+        if (!shaped || width <= 0 || height <= 0 || width > COLUMNS || height > ROWS
+                || width * height != ingredients.size()) {
             // 无序配方：从第一个格子往后依次摆
             for (int i = 0; i < positions.length; i++) {
                 positions[i] = Math.min(i, SmartWorkbenchBlockEntity.GRID_SIZE - 1);
@@ -1843,7 +1924,9 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         int offsetX = (COLUMNS - width) / 2;
         int offsetY = (ROWS - height) / 2;
         for (int i = 0; i < positions.length; i++) {
-            positions[i] = (offsetY + i / width) * COLUMNS + offsetX + i % width;
+            int slot = (offsetY + i / width) * COLUMNS + offsetX + i % width;
+            // 上面已经校验过 size == width*height，这里夹一次只是最后一道保险
+            positions[i] = Math.max(0, Math.min(SmartWorkbenchBlockEntity.GRID_SIZE - 1, slot));
         }
         return positions;
     }
@@ -1867,7 +1950,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
     private void pullChainFromStorage(ServerPlayer player, CraftingRecipe recipe) {
         returnMatrixMaterials(player);
         this.bench.refreshStorages(true);
-        StoragePool pool = StoragePool.collect(inputHandlers());
+        StoragePool pool = collectInputPool();
         PlannedRecipe planned = planBest(recipe, pool);
         // 这个入口是「直接材料不齐」才进来的，一般 autoCraftable 非空；但摆位重试时
         // 也可能材料其实够，所以只要步骤齐、没缺口就继续，交给后面的 matches 复核。
@@ -1931,6 +2014,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
      */
     private void stowOrReturn(ServerPlayer player, List<ItemStack> stacks) {
         List<IItemHandler> storages = this.bench == null ? List.of() : this.bench.getStorages();
+        boolean wroteBack = false;
         for (ItemStack stack : stacks) {
             if (stack.isEmpty()) {
                 continue;
@@ -1939,6 +2023,12 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             if (!rest.isEmpty() && !player.getInventory().add(rest)) {
                 player.drop(rest, false);
             }
+            wroteBack = true;
+        }
+        // 塞进箱子就可能占了原本空着的格子，手里的库存快照要整份重扫才看得见它们。
+        // 这里宁可多标一次：重扫一轮的开销远小于算错库存（少做/多做）的代价。
+        if (wroteBack) {
+            this.poolStale = true;
         }
         stacks.clear();
     }
@@ -2029,7 +2119,18 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             return CRAFT_MISSING;
         }
         this.bench.refreshStorages(true);
-        StoragePool pool = StoragePool.collect(inputHandlers());
+        return chainCraftOnce(player, recipe, toOutput, notifyOnFail, collectInputPool());
+    }
+
+    /**
+     * 复用调用方刚 collect 好的库存（批量循环里每轮重扫全部处理器很贵）。
+     * {@code pool} 必须已经反映当前真实库存；规划只读快照，不会把它改脏。
+     */
+    private int chainCraftOnce(ServerPlayer player, CraftingRecipe recipe, boolean toOutput,
+                               boolean notifyOnFail, StoragePool pool) {
+        if (this.bench == null) {
+            return CRAFT_MISSING;
+        }
         PlannedRecipe planned = planBest(recipe, pool);
         if (!planned.succeeded()) {
             if (notifyOnFail) {
@@ -2052,7 +2153,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             return;
         }
         this.bench.refreshStorages(true);
-        StoragePool pool = StoragePool.collect(inputHandlers());
+        StoragePool pool = collectInputPool();
         int outcome = craftOnce(player, recipe, pool, false);
         if (outcome == CRAFT_MISSING && this.autoRefillEnabled) {
             outcome = chainCraftOnce(player, recipe, false, true);
@@ -2092,9 +2193,10 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         this.bench.refreshStorages(true);
         int crafted = 0;
         int outcome = CRAFT_OK;
+        boolean inventoryFull = false;
         int limit = resolveBatchLimit(requestedCount);
+        StoragePool pool = collectInputPool();
         for (int guard = 0; guard < limit; guard++) {
-            StoragePool pool = StoragePool.collect(inputHandlers());
             if (pool.isEmpty()) {
                 outcome = CRAFT_MISSING;
                 if (crafted == 0) {
@@ -2104,15 +2206,31 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             }
             outcome = craftOnce(player, recipe, pool, crafted == 0 && !this.autoRefillEnabled);
             if (outcome == CRAFT_MISSING && this.autoRefillEnabled) {
-                outcome = chainCraftOnce(player, recipe, false, crafted == 0);
+                // 失败的合成会退款，但本地计数在退款时不会回加；规划前先回读真实数量
+                pool = refreshPool(pool);
+                if (pool.isEmpty()) {
+                    break;
+                }
+                outcome = chainCraftOnce(player, recipe, false, crafted == 0, pool);
+            }
+            if (outcome == CRAFT_INVENTORY_FULL) {
+                // 背包放不下，产物已掉在脚下；这一次材料确实用掉了，算一次再停
+                crafted++;
+                inventoryFull = true;
+                break;
             }
             if (outcome != CRAFT_OK) {
                 break;
             }
             crafted++;
+            pool = refreshPool(pool);
         }
         if (crafted > 0) {
             notifyFeedback(player, crafted);
+        }
+        if (inventoryFull) {
+            notify(player, "背包没有空位了，产物掉在脚下，批量合成已停止",
+                    "gui." + SmartWorkbenchMod.MOD_ID + ".msg.inventory_full");
         }
         markDirty();
         updateResult();
@@ -2148,9 +2266,10 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         returnMatrixMaterials(player);
         this.bench.refreshStorages(true);
         int crafted = 0;
+        boolean inventoryFull = false;
         int limit = resolveBatchLimit(requestedCount);
+        StoragePool pool = collectInputPool();
         for (int guard = 0; guard < limit; guard++) {
-            StoragePool pool = StoragePool.collect(inputHandlers());
             if (pool.isEmpty()) {
                 if (crafted == 0) {
                     notify(player, "附近存储和背包材料不足", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.not_enough");
@@ -2160,15 +2279,31 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             // 只有第一次失败时才提示，中途没料了是正常结束
             int outcome = craftOnce(player, recipe, pool, crafted == 0 && !this.autoRefillEnabled);
             if (outcome == CRAFT_MISSING && this.autoRefillEnabled) {
-                outcome = chainCraftOnce(player, recipe, false, crafted == 0);
+                // 退款不会回加本地计数，先按真实库存修正
+                pool = refreshPool(pool);
+                if (pool.isEmpty()) {
+                    break;
+                }
+                outcome = chainCraftOnce(player, recipe, false, crafted == 0, pool);
+            }
+            if (outcome == CRAFT_INVENTORY_FULL) {
+                // 背包放不下，产物已掉在脚下；这一次材料确实用掉了，算一次再停
+                crafted++;
+                inventoryFull = true;
+                break;
             }
             if (outcome != CRAFT_OK) {
                 break;
             }
             crafted++;
+            pool = refreshPool(pool);
         }
         if (crafted > 0) {
             notifyFeedback(player, crafted);
+        }
+        if (inventoryFull) {
+            notify(player, "背包没有空位了，产物掉在脚下，批量合成已停止",
+                    "gui." + SmartWorkbenchMod.MOD_ID + ".msg.inventory_full");
         }
         markDirty();
         updateResult();
@@ -2230,24 +2365,39 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         // 自动合成完全独立于合成格，先归还当前格子，防止把同一份材料重复算入库存。
         returnMatrixMaterials(player);
 
+        StoragePool pool = collectInputPool();
         for (int i = 0; i < limit; i++) {
-            StoragePool pool = StoragePool.collect(inputHandlers());
             if (pool.isEmpty()) {
                 outcome = CRAFT_MISSING;
                 break;
             }
-            // 先试直接合成；这一步不成功时 pool 没被消耗（失败会退款）
+            // 先试直接合成；这一步不成功时 pool 会退款，本地计数可能偏低，下一轮前回读真实数量
             outcome = craftOnce(player, recipe, pool, false, true);
             if (outcome == CRAFT_OK) {
                 crafted++;
+                pool = refreshPool(pool);
                 continue;
+            }
+            if (outcome == CRAFT_OUTPUT_FULL) {
+                // 产物已经退回背包，这一次是算数的，但输出容器满了就到此为止
+                crafted++;
+                break;
+            }
+            if (outcome == CRAFT_INVENTORY_FULL) {
+                // 背包也满了，产物掉在脚下；材料确实消耗掉，算一次再停
+                crafted++;
+                break;
             }
             if (outcome != CRAFT_MISSING) {
                 break;
             }
-            // 直接材料不够：重新读一遍库存，规划整棵依赖树，能补齐就补一次
-            StoragePool planPool = StoragePool.collect(inputHandlers());
-            PlannedRecipe planned = planBest(recipe, planPool);
+            // 直接材料不够：先按真实库存修正账目，再规划整棵依赖树，能补齐就补一次
+            pool = refreshPool(pool);
+            if (pool.isEmpty()) {
+                outcome = CRAFT_MISSING;
+                break;
+            }
+            PlannedRecipe planned = planBest(recipe, pool);
             if (!planned.succeeded()) {
                 missing = planned.missing();
                 planAborted = planned.aborted();
@@ -2256,11 +2406,17 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             }
             // 玩家点的那份做不出来时，换成同产物里真正能做的那份，后续几轮也沿用
             recipe = planned.recipe();
-            int recursive = executeRecursivePlan(player, planned.state().steps, planPool, true);
-            if (recursive == CRAFT_OK || recursive == CRAFT_OUTPUT_FULL) {
-                // 输出容器满时产物已退回背包，这次合成仍然算数
+            int recursive = executeRecursivePlan(player, planned.state().steps, pool, true);
+            if (recursive == CRAFT_OK) {
                 crafted++;
+                pool = refreshPool(pool);
                 continue;
+            }
+            if (recursive == CRAFT_OUTPUT_FULL) {
+                // 输出容器满时产物已退回背包，这次合成仍然算数，但后面不再继续
+                crafted++;
+                outcome = CRAFT_OUTPUT_FULL;
+                break;
             }
             outcome = recursive;
             missing = planned.missing();
@@ -2269,8 +2425,17 @@ public class SmartWorkbenchMenu extends CraftingMenu {
 
         if (crafted > 0) {
             notifyFeedback(player, crafted);
+            if (outcome == CRAFT_OUTPUT_FULL) {
+                notify(player, "输出容器满了，产物已退回背包", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.output_full");
+            } else if (outcome == CRAFT_INVENTORY_FULL) {
+                notify(player, "背包没有空位了，产物掉在脚下，自动合成已停止",
+                        "gui." + SmartWorkbenchMod.MOD_ID + ".msg.inventory_full");
+            }
         } else if (outcome == CRAFT_OUTPUT_FULL) {
             notify(player, "输出容器满了，产物已退回背包", "gui." + SmartWorkbenchMod.MOD_ID + ".msg.output_full");
+        } else if (outcome == CRAFT_INVENTORY_FULL) {
+            notify(player, "背包没有空位了，产物掉在脚下",
+                    "gui." + SmartWorkbenchMod.MOD_ID + ".msg.inventory_full");
         } else if (outcome == CRAFT_UNSUPPORTED) {
             notify(player, "这个配方不支持一键合成，请点图标取料到合成格",
                     "gui." + SmartWorkbenchMod.MOD_ID + ".msg.unsupported");
@@ -2297,7 +2462,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             return;
         }
         this.bench.refreshStorages(true);
-        StoragePool pool = StoragePool.collect(inputHandlers());
+        StoragePool pool = collectInputPool();
         PlannedRecipe planned = planBest(target, pool);
         if (!planned.succeeded()) {
             notifyPlanFailure(player, planned);
@@ -2331,7 +2496,7 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             return;
         }
         this.bench.refreshStorages(true);
-        StoragePool pool = StoragePool.collect(inputHandlers());
+        StoragePool pool = collectInputPool();
         PlannedRecipe planned = planBest(target, pool);
         if (!planned.succeeded()) {
             if (!planned.missing().isEmpty()) {
@@ -3009,11 +3174,21 @@ public class SmartWorkbenchMenu extends CraftingMenu {
             return CRAFT_OK;
         }
         if (toOutput) {
+            // 没绑输出容器时不能走「塞不进输出容器」的分支：那会把每一次都判成
+            // CRAFT_OUTPUT_FULL，自动合成做完 1 个就停（默认配置下正是没绑输出容器）。
+            // 没绑就按普通交付处理，产物退回背包，和 README 的说明一致。
+            if (this.bench == null || this.bench.getOutputStorages().isEmpty()) {
+                if (player.getInventory().add(stack)) {
+                    return CRAFT_OK;
+                }
+                player.drop(stack, false);
+                return CRAFT_INVENTORY_FULL;
+            }
             ItemStack rest = insertIntoOutputs(stack);
             if (rest.isEmpty()) {
                 return CRAFT_OK;
             }
-            // 输出容器满了：剩下的退回背包，保证不丢，但这次自动合成要停下
+            // 输出容器满了：剩下的退回背包，保证不丢；调用方会把这个产物计入本次合成后停止
             if (!player.getInventory().add(rest)) {
                 player.drop(rest, false);
             }
@@ -3024,6 +3199,30 @@ public class SmartWorkbenchMenu extends CraftingMenu {
         }
         player.drop(stack, false);
         return CRAFT_INVENTORY_FULL;
+    }
+
+    /**
+     * 批量/自动合成的下一轮沿用同一份 {@link StoragePool}：只回读每个已知格子的当前数量，
+     * 不重新扫描全部处理器（上千轮时这部分才是大头）。格子里被换成别的物品时才整份重扫。
+     * <p>
+     * 但只要本轮往箱子里写回过东西（{@link #stowOrReturn}、原路退回），快照就可能漏掉
+     * 「原本空着、刚塞进去」的格子，必须整份重扫——见 {@link #poolStale}。
+     */
+    private StoragePool refreshPool(StoragePool pool) {
+        if (this.poolStale) {
+            this.poolStale = false;
+            return StoragePool.collect(inputHandlers());
+        }
+        if (pool != null && pool.refreshCounts()) {
+            return pool;
+        }
+        return StoragePool.collect(inputHandlers());
+    }
+
+    /** 收集一份当前库存快照，并清掉「需要重扫」的标记（新快照本来就不可能是脏的）。 */
+    private StoragePool collectInputPool() {
+        this.poolStale = false;
+        return StoragePool.collect(inputHandlers());
     }
 
     /** 把产物塞进所有绑定的输出容器，返回塞不下的部分（没绑输出容器时原样返回）。 */

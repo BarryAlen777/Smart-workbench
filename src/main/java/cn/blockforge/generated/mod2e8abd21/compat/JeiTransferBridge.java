@@ -219,9 +219,11 @@ public final class JeiTransferBridge {
                 case "getContainerClass":
                     return SmartWorkbenchMenu.class;
                 case "getMenuType":
-                    return Optional.of(ModRegistries.SMART_WORKBENCH_MENU.get());
+                    // JEI 各版本这里可能是 Optional<IMenuType> 也可能是裸值：按接口声明的返回类型适配，
+                    // 否则返回类型对不上时 JEI 会拿到 null 去强转/解引用，变成它自己那边刷屏报错。
+                    return forReturnType(method.getReturnType(), ModRegistries.SMART_WORKBENCH_MENU.get());
                 case "getRecipeType":
-                    return craftingRecipeType;
+                    return forReturnType(method.getReturnType(), craftingRecipeType);
                 case "transferRecipe":
                     return safeTransfer(args);
                 case "equals":
@@ -236,12 +238,30 @@ public final class JeiTransferBridge {
         }
     }
 
+    /** 按接口声明的返回类型包装值：Optional 就包一层，裸值就原样返回，类型对不上返回 null。 */
+    private static Object forReturnType(Class<?> returnType, Object value) {
+        if (value == null) {
+            return Optional.class.isAssignableFrom(returnType) ? Optional.empty() : null;
+        }
+        if (Optional.class.isAssignableFrom(returnType)) {
+            return Optional.of(value);
+        }
+        return returnType.isInstance(value) ? value : null;
+    }
+
     private static Object safeTransfer(Object[] args) {
         try {
             return transfer(args);
         } catch (Throwable ignored) {
-            // 出问题就当没这回事，把按钮交回给 JEI 自己显示，别把界面搞崩
-            return null;
+            // JEI 约定：返回 null = 转移成功。异常时绝不能返回 null，否则按钮还是绿色、
+            // 点了却毫无反应。改成一条用户可见的错误，至少让玩家知道这次没成。
+            try {
+                return userError(0, Component.translatableWithFallback(
+                        "gui." + SmartWorkbenchMod.MOD_ID + ".msg.transfer_error",
+                        "一键取料时发生内部错误，请重试或改用页签加号"));
+            } catch (Throwable ignoredAgain) {
+                return null;
+            }
         }
     }
 
@@ -275,14 +295,17 @@ public final class JeiTransferBridge {
                     "gui." + SmartWorkbenchMod.MOD_ID + ".msg.unsupported",
                     "这个配方不支持一键取料"));
         }
-        List<ItemStack> missing = findMissing(mcRecipe,
-                MaterialAvailability.collectAvailable(menu, Minecraft.getInstance().player));
         // 快照只用于 JEI 的悬停提示；真正点击时必须交给服务端重新读取存储，
         // 否则箱子刚被漏斗补料就会被旧快照误判为缺料。
-        if (!missing.isEmpty() && !doTransfer) {
-            return userError(missing.size(), Component.translatableWithFallback(
-                    "gui." + SmartWorkbenchMod.MOD_ID + ".msg.transfer_missing",
-                    "接入存储和背包里还缺 %s 种材料", missing.size()));
+        // 快照被 512 种上限截断时也不能拿它判缺料：大仓库会误报，直接放行交给服务端。
+        if (!menu.isClientStorageTruncated()) {
+            List<ItemStack> missing = findMissing(mcRecipe,
+                    MaterialAvailability.collectAvailable(menu, Minecraft.getInstance().player));
+            if (!missing.isEmpty() && !doTransfer) {
+                return userError(missing.size(), Component.translatableWithFallback(
+                        "gui." + SmartWorkbenchMod.MOD_ID + ".msg.transfer_missing",
+                        "接入存储和背包里还缺 %s 种材料", missing.size()));
+            }
         }
         if (doTransfer) {
             ResourceLocation id = mcRecipe.getId();
@@ -405,6 +428,10 @@ public final class JeiTransferBridge {
         }
         if (type == char.class) {
             return (char) 0;
+        }
+        // 返回 Optional 的方法给空 Optional，别给 null：JEI 很多调用点直接 .orElse()。
+        if (Optional.class.isAssignableFrom(type)) {
+            return Optional.empty();
         }
         return null;
     }

@@ -201,9 +201,10 @@ public final class ReiTransferBridge {
         Object display = invokeContext(contextGetDisplay, context);
         cn.blockforge.generated.mod2e8abd21.menu.SmartWorkbenchMenu workbench =
                 (cn.blockforge.generated.mod2e8abd21.menu.SmartWorkbenchMenu) menu;
-        // 客户端还没收到存储快照（刚打开界面那一瞬）：本地根本不知道箱子里有什么，
-        // 此时的「缺料」结论不作数，先放行；真正点击时由服务端拿真实库存裁决。
-        if (!workbench.hasClientStorageSnapshot()) {
+        // 客户端还没收到存储快照（刚打开界面那一瞬），或快照因为超过上限被截断：
+        // 本地根本不知道箱子里有什么，此时的「缺料」结论不作数，先放行；
+        // 真正点击时由服务端拿真实库存裁决。
+        if (!workbench.hasClientStorageSnapshot() || workbench.isClientStorageTruncated()) {
             return applicabilityCreateApplicable.invoke(null);
         }
         List<Object> missing = findMissing(display,
@@ -261,10 +262,14 @@ public final class ReiTransferBridge {
         if (crafting) {
             // 必须在这里拦截缺料，而不是无条件返回成功；否则 REI 会继续交给原版处理器，
             // 玩家明明缺木棍时仍然能看见可点击的“+”按钮。
-            List<Object> missing = findMissing(display,
-                    MaterialAvailability.collectAvailable(workbench, Minecraft.getInstance().player));
-            if (!missing.isEmpty()) {
-                return resultBlocksFurtherHandling.invoke(failedResult(missing), true);
+            // 客户端快照被截断时不能拿它判缺料：大仓库里只抄了前 512 种，缺料结论不作数，
+            // 直接放行交给服务端按真实库存裁决。
+            if (!workbench.isClientStorageTruncated()) {
+                List<Object> missing = findMissing(display,
+                        MaterialAvailability.collectAvailable(workbench, Minecraft.getInstance().player));
+                if (!missing.isEmpty()) {
+                    return resultBlocksFurtherHandling.invoke(failedResult(missing), true);
+                }
             }
             Object screen = invokeContext(contextGetContainerScreen, context);
             if (screen instanceof Screen mcScreen) {
@@ -277,7 +282,10 @@ public final class ReiTransferBridge {
                 ModNetwork.sendToServer(new C2SPlaceRecipePacket(workbench.getBenchPos(), id, stacked));
             }
         }
-        return resultCreateSuccessful.invoke(null);
+        // 成功分支也必须阻断后面的处理器：不然 REI 可能让原版工作台处理器再搬一次料
+        //（甚至再发一个 PlaceRecipePacket），和我们已经发出的摆料包叠在一起，格子会被摆两遍。
+        Object success = resultCreateSuccessful.invoke(null);
+        return resultBlocksFurtherHandling.invoke(success, true);
     }
 
     /**

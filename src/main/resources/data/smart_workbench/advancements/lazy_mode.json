@@ -1,0 +1,37 @@
+{
+  "display": {
+    "icon": {
+      "item": "smart_workbench:smart_workbench"
+    },
+    "title": {
+      "translate": "advancements.smart_workbench.lazy_mode.title"
+    },
+    "description": {
+      "translate": "advancements.smart_workbench.lazy_mode.description"
+    },
+    "frame": "task",
+    "background": "minecraft:textures/block/oak_planks.png",
+    "show_toast": true,
+    "announce_to_chat": true,
+    "hidden": false
+  },
+  "criteria": {
+    "has_smart_workbench": {
+      "trigger": "minecraft:inventory_changed",
+      "conditions": {
+        "items": [
+          {
+            "items": [
+              "smart_workbench:smart_workbench"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "requirements": [
+    [
+      "has_smart_workbench"
+    ]
+  ]
+}

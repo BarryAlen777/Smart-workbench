@@ -27,7 +27,11 @@ public final class CraftableSearch {
 
     /** 这个物品是不是命中搜索词；搜索词为空表示全都命中。 */
     public static boolean matches(CraftableEntry entry, String query) {
-        String needle = normalize(query);
+        return matchesNormalized(entry, normalize(query));
+    }
+
+    /** 已经归一化过的搜索词：筛整个列表时只归一化一次，别每条物品重复算。 */
+    public static boolean matchesNormalized(CraftableEntry entry, String needle) {
         if (needle.isEmpty()) {
             return true;
         }
@@ -93,7 +97,7 @@ public final class CraftableSearch {
     }
 
     /** 搜索词也做同样的归一化，玩家多打了空格、大小写不一样都没关系。 */
-    private static String normalize(String query) {
+    public static String normalize(String query) {
         if (query == null || query.isEmpty()) {
             return "";
         }

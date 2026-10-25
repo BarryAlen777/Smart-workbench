@@ -21,7 +21,11 @@ import net.minecraftforge.network.simple.SimpleChannel;
  */
 public final class ModNetwork {
 
-    private static final String VERSION = "2";
+    /**
+     * 网络协议版本。{@code S2CCraftableListPacket} 这轮多了一个「快照被截断」的布尔字段，
+     * 新旧版本不能混连，所以版本号必须跟着加一（连不上会明确提示版本不一致，而不是解包错位）。
+     */
+    private static final String VERSION = "3";
     private static final SimpleChannel INSTANCE = NetworkRegistry.newSimpleChannel(
             new ResourceLocation(SmartWorkbenchMod.MOD_ID, "main"),
             () -> VERSION,

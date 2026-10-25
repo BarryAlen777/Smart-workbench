@@ -48,9 +48,11 @@ public final class CraftableListView {
 
     public static List<Cell> build(List<CraftableEntry> entries, String query, boolean folding,
                                    Set<String> expandedGroups) {
+        // 搜索词只归一化一次：以前每条物品都重新压一遍空格/大小写，几千条 × 每次按键白烧 CPU。
+        String needle = CraftableSearch.normalize(query);
         List<CraftableEntry> filtered = new ArrayList<>(entries.size());
         for (CraftableEntry entry : entries) {
-            if (CraftableSearch.matches(entry, query)) {
+            if (CraftableSearch.matchesNormalized(entry, needle)) {
                 filtered.add(entry);
             }
         }
@@ -96,6 +98,10 @@ public final class CraftableListView {
                 out.add(new Cell(entry, key, true, size));
                 if (expandedGroups.contains(key)) {
                     for (CraftableEntry member : members.get(key)) {
+                        // 折叠头用的就是第一个成员，这里再发一遍会让橡木楼梯之类的项显示两格
+                        if (member == entry) {
+                            continue;
+                        }
                         out.add(new Cell(member, key, false, size));
                     }
                 }

@@ -77,9 +77,20 @@ public final class ArchitecturyLoginRaceFix {
         if (entries.size() == map.size()) {
             return; // 表本身是自洽的，不动它
         }
-        map.clear();
-        for (Map.Entry entry : entries) {
-            map.put(entry.getKey(), entry.getValue());
+        // 先在一张新表里把内容拼好，再一次性替换静态字段：读线程只会看到「旧表」或「新表」，
+        // 不会看到 clear() 到 put() 之间那段半空窗口（原做法会让同时登录的其他玩家丢包/被踢）。
+        HashMap<Object, Object> rebuilt = new HashMap<>(Math.max(16, entries.size() * 2));
+        for (Map.Entry<?, ?> entry : entries) {
+            rebuilt.put(entry.getKey(), entry.getValue());
+        }
+        if (!java.lang.reflect.Modifier.isFinal(field.getModifiers())) {
+            field.set(null, rebuilt);
+        } else {
+            // 字段是 final 时没法换引用，只能在原表上重建；尽量缩短窗口。
+            synchronized (map) {
+                map.clear();
+                map.putAll(rebuilt);
+            }
         }
         if (!repairedOnce) {
             repairedOnce = true;

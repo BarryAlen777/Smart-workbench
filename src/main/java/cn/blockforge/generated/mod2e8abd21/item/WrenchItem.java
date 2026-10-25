@@ -66,7 +66,7 @@ public class WrenchItem extends Item {
         if (player.isSecondaryUseActive()) {
             if (!level.isClientSide) {
                 boolean toOutput = toggleMode(stack);
-                feedback(player, toOutput
+                feedback(player, toOutput ? "mode_output" : "mode_input", toOutput
                         ? "绑定模式：输出容器（产物会送进去）"
                         : "绑定模式：取料容器（工作台从它抽材料）");
             }
@@ -98,9 +98,9 @@ public class WrenchItem extends Item {
                 clearSelectedTarget(stack, false);
                 clearSelectedTarget(stack, true);
                 clearSelectedWorkbench(stack);
-                feedback(player, cleared > 0
+                feedback(player, cleared > 0 ? "cleared" : "no_bindings", cleared > 0
                         ? "已清空这个工作台的 " + cleared + " 个绑定"
-                        : "这个工作台还没有绑定任何容器");
+                        : "这个工作台还没有绑定任何容器", cleared);
                 return InteractionResult.CONSUME;
             }
             boolean output = isOutputMode(stack);
@@ -109,12 +109,12 @@ public class WrenchItem extends Item {
                 clearSelectedTarget(stack, false);
                 clearSelectedTarget(stack, true);
                 writeSelectedWorkbench(stack, pos, level.dimension().location().toString());
-                feedback(player, "已选中这个工作台，再右键容器即可完成绑定或取消绑定");
+                feedback(player, "selected_bench", "已选中这个工作台，再右键容器即可完成绑定或取消绑定");
                 return InteractionResult.CONSUME;
             }
             String dimension = readDimension(stack);
             if (dimension != null && !dimension.equals(level.dimension().location().toString())) {
-                feedback(player, "选中的容器在别的维度，绑定不了");
+                feedback(player, "wrong_dimension_container", "选中的容器在别的维度，绑定不了");
                 return InteractionResult.CONSUME;
             }
             // 再次点已经绑定的同一个容器就是取消绑定，避免必须潜行清空全部绑定。
@@ -130,24 +130,30 @@ public class WrenchItem extends Item {
             if (removed) {
                 clearSelectedTarget(stack, output);
                 clearSelectedWorkbench(stack);
-                feedback(player, removedOutput
+                feedback(player, removedOutput ? "unbound_output" : "unbound_input", removedOutput
                         ? "已取消输出容器绑定：" + target.toShortString()
-                        : "已取消取料容器绑定：" + target.toShortString());
+                        : "已取消取料容器绑定：" + target.toShortString(), target.toShortString());
                 return InteractionResult.CONSUME;
             }
             if (!bench.canBind(target)) {
-                feedback(player, "选中的容器已经不在了，或它本身是工作台");
+                feedback(player, "container_gone", "选中的容器已经不在了，或它本身是工作台");
                 return InteractionResult.CONSUME;
             }
             boolean added = output ? bench.addOutputBinding(target) : bench.addBinding(target);
             if (added) {
                 clearSelectedTarget(stack, output);
                 clearSelectedWorkbench(stack);
-                feedback(player, output
-                        ? "已把 " + target.toShortString() + " 绑成输出容器，当前输出容器 " + bench.getOutputBindingCount() + " 个"
-                        : "已绑定 " + target.toShortString() + "，当前取料容器 " + bench.getBindingCount() + " 个");
+                if (output) {
+                    feedback(player, "bound_output",
+                            "已把 %s 绑成输出容器，当前输出容器 %s 个",
+                            target.toShortString(), bench.getOutputBindingCount());
+                } else {
+                    feedback(player, "bound_input",
+                            "已绑定 %s，当前取料容器 %s 个",
+                            target.toShortString(), bench.getBindingCount());
+                }
             } else {
-                feedback(player, output
+                feedback(player, output ? "cannot_bind_input" : "cannot_bind_output", output
                         ? "绑不了：重复了、上限到了，或这个容器已经当成取料容器"
                         : "绑不了：重复了、上限到了，或这个容器已经当成输出容器");
             }
@@ -173,7 +179,7 @@ public class WrenchItem extends Item {
             String benchDimension = readSelectedWorkbenchDimension(stack);
             if (benchDimension != null && !benchDimension.equals(level.dimension().location().toString())) {
                 clearSelectedWorkbench(stack);
-                feedback(player, "选中的工作台在别的维度，绑定不了");
+                feedback(player, "wrong_dimension_bench", "选中的工作台在别的维度，绑定不了");
                 return InteractionResult.CONSUME;
             }
             if (level.getBlockEntity(selectedWorkbench) instanceof SmartWorkbenchBlockEntity bench) {
@@ -183,41 +189,53 @@ public class WrenchItem extends Item {
                     clearSelectedTarget(stack, false);
                     clearSelectedTarget(stack, true);
                     clearSelectedWorkbench(stack);
-                    feedback(player, removedOutput
+                    feedback(player, removedOutput ? "unbound_output" : "unbound_input", removedOutput
                             ? "已取消输出容器绑定：" + pos.toShortString()
-                            : "已取消取料容器绑定：" + pos.toShortString());
+                            : "已取消取料容器绑定：" + pos.toShortString(), pos.toShortString());
                     return InteractionResult.CONSUME;
                 }
 
                 boolean output = isOutputMode(stack);
                 if (!bench.canBind(pos)) {
                     clearSelectedWorkbench(stack);
-                    feedback(player, "选中的容器已经不在了，或它本身是工作台");
+                    feedback(player, "container_gone", "选中的容器已经不在了，或它本身是工作台");
                     return InteractionResult.CONSUME;
                 }
                 boolean added = output ? bench.addOutputBinding(pos) : bench.addBinding(pos);
                 clearSelectedTarget(stack, false);
                 clearSelectedTarget(stack, true);
                 clearSelectedWorkbench(stack);
-                feedback(player, added
-                        ? (output
-                                ? "已把 " + pos.toShortString() + " 绑成输出容器，当前输出容器 " + bench.getOutputBindingCount() + " 个"
-                                : "已绑定 " + pos.toShortString() + "，当前取料容器 " + bench.getBindingCount() + " 个")
-                        : (output
-                                ? "绑不了：重复了、上限到了，或这个容器已经当成取料容器"
-                                : "绑不了：重复了、上限到了，或这个容器已经当成输出容器"));
+                if (added) {
+                    if (output) {
+                        feedback(player, "bound_output",
+                                "已把 %s 绑成输出容器，当前输出容器 %s 个",
+                                pos.toShortString(), bench.getOutputBindingCount());
+                    } else {
+                        feedback(player, "bound_input",
+                                "已绑定 %s，当前取料容器 %s 个",
+                                pos.toShortString(), bench.getBindingCount());
+                    }
+                } else {
+                    feedback(player, output ? "cannot_bind_input" : "cannot_bind_output", output
+                            ? "绑不了：重复了、上限到了，或这个容器已经当成取料容器"
+                            : "绑不了：重复了、上限到了，或这个容器已经当成输出容器");
+                }
                 return InteractionResult.CONSUME;
             }
             clearSelectedWorkbench(stack);
-            feedback(player, "选中的工作台已经不存在了");
+            feedback(player, "bench_gone", "选中的工作台已经不存在了");
             return InteractionResult.CONSUME;
         }
 
         boolean output = isOutputMode(stack);
         writeTarget(stack, pos, level.dimension().location().toString(), output);
-        feedback(player, output
-                ? "已选中容器 " + pos.toShortString() + "，右键智能工作台绑成输出容器"
-                : "已选中容器 " + pos.toShortString() + "，右键智能工作台完成绑定");
+        if (output) {
+            feedback(player, "selected_container_output",
+                    "已选中容器 %s，右键智能工作台绑成输出容器", pos.toShortString());
+        } else {
+            feedback(player, "selected_container_input",
+                    "已选中容器 %s，右键智能工作台完成绑定", pos.toShortString());
+        }
         return InteractionResult.CONSUME;
     }
 
@@ -346,7 +364,14 @@ public class WrenchItem extends Item {
                 .withStyle(ChatFormatting.DARK_GRAY));
     }
 
-    private static void feedback(Player player, String text) {
-        player.displayClientMessage(Component.literal(text), true);
+    /**
+     * 动作条提示。以前全部硬编码中文，英文客户端会看到一屏中文；
+     * 现在统一走语言文件（key 为 {@code gui.smart_workbench.wrench.msg.*}），
+     * 没翻译的条目仍然用 fallback 的中文兜底。
+     */
+    private static void feedback(Player player, String key, String fallback, Object... args) {
+        player.displayClientMessage(Component.translatableWithFallback(
+                "gui." + cn.blockforge.generated.mod2e8abd21.SmartWorkbenchMod.MOD_ID + ".wrench.msg." + key,
+                fallback, args), true);
     }
 }

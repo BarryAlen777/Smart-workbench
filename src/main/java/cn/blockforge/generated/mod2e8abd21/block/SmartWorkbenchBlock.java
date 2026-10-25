@@ -43,12 +43,14 @@ public class SmartWorkbenchBlock extends BaseEntityBlock {
         if (player.getItemInHand(hand).getItem() instanceof WrenchItem) {
             return InteractionResult.PASS;
         }
-        if (level.isClientSide) {
-            return InteractionResult.SUCCESS;
-        }
+        // 潜行右键的判断必须在 isClientSide 之前：以前客户端先返回 SUCCESS、服务端返回 PASS，
+        // 两边结果不一致，客户端会多播一次挥手/放置动画，方块的摆放也跟着抖。
         if (player.isSecondaryUseActive()) {
             // 潜行右键不打开界面，方便往工作台上放方块
             return InteractionResult.PASS;
+        }
+        if (level.isClientSide) {
+            return InteractionResult.SUCCESS;
         }
         if (level.getBlockEntity(pos) instanceof SmartWorkbenchBlockEntity blockEntity
                 && player instanceof ServerPlayer serverPlayer && blockEntity.stillValid(player)) {
