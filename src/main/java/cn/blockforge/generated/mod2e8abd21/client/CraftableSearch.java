@@ -86,6 +86,30 @@ public final class CraftableSearch {
         return new Keys(flat.toString(), pinyin.toString(), initials.toString());
     }
 
+    /**
+     * 「按名称」排序用的键：和搜索走同一张 {@link PinyinTable}。
+     * 以前排序用 {@code Collator(Locale.CHINA)}、搜索用拼音表，两套读音数据源，
+     * 冷僻字或异读词上会出现「搜得到、但排在这一类外面」的别扭情况；统一成同一份拼音就没有了。
+     */
+    public static String pinyinSortKey(ItemStack stack) {
+        String name = stack.getHoverName().getString();
+        StringBuilder out = new StringBuilder(name.length() * 4);
+        name.codePoints().forEach(codePoint -> {
+            // 拼音表按 char 建（BMP 内），超出基本多文种平面的码点直接当普通字符处理
+            String py = codePoint <= 0xFFFF ? PinyinTable.pinyin((char) codePoint) : null;
+            if (py != null) {
+                out.append(py);
+            } else if (isAsciiAlphaNumeric(codePoint)) {
+                out.appendCodePoint(Character.toLowerCase(codePoint));
+            } else if (codePoint > 0x7F) {
+                // 表里没有的（日文假名、西里尔字母、生僻字……）原样留着参与比较，
+                // 别整串变成空键——那会让这些名字全部挤到列表最前面
+                out.appendCodePoint(codePoint);
+            }
+        });
+        return out.toString();
+    }
+
     private static void appendSearchable(StringBuilder out, String text) {
         text.codePoints().forEach(codePoint -> {
             if (isAsciiAlphaNumeric(codePoint)) {

@@ -18,6 +18,13 @@ public class S2CRecursiveCraftPromptPacket {
     /** 和可合成列表一样，原版 writeItem 一个字节装不下超过 127 的数量，物品按 1 个写、真实数量走 varint。 */
     private static final int MAX_STACK_COUNT = 1_000_000;
 
+    /**
+     * 解码时最多收多少条缺料：正常一次顶层合成最多 9 种材料，递归展开也不会到几十。
+     * 包长字段是服务端写的，异构/恶意服务端报个天文数字时照单收会当场 OOM；
+     * 超出的条目照样读掉（保证后续字段对得上），只是不装进列表。
+     */
+    private static final int MAX_DECODE_ENTRIES = 256;
+
     public record MissingEntry(net.minecraft.world.item.ItemStack stack, int count, boolean craftable) {
         public MissingEntry(FriendlyByteBuf buf) {
             this(readStack(buf), buf.readVarInt(), buf.readBoolean());
@@ -61,10 +68,17 @@ public class S2CRecursiveCraftPromptPacket {
     }
 
     private static List<MissingEntry> readEntries(FriendlyByteBuf buf) {
-        int size = buf.readVarInt();
-        List<MissingEntry> entries = new ArrayList<>(size);
+        int size = Math.max(0, buf.readVarInt());
+        int cap = Math.min(size, MAX_DECODE_ENTRIES);
+        List<MissingEntry> entries = new ArrayList<>(cap);
         for (int i = 0; i < size; i++) {
-            entries.add(new MissingEntry(buf));
+            if (buf.readableBytes() <= 0) {
+                break;
+            }
+            MissingEntry entry = new MissingEntry(buf);
+            if (i < cap) {
+                entries.add(entry);
+            }
         }
         return List.copyOf(entries);
     }

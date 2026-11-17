@@ -1,10 +1,8 @@
 package cn.blockforge.generated.mod2e8abd21.menu;
 
-import net.minecraft.core.RegistryAccess;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.crafting.CraftingRecipe;
 import net.minecraft.world.item.crafting.Ingredient;
 
 import java.util.ArrayList;
@@ -21,14 +19,17 @@ import java.util.Set;
  * 于是会出现「铁砧＝3 铁块＋4 铁锭，库存铁够 27 个但不够 31 个」这类项：类型上全都有，
  * 列在表里，点下去却弹「缺少基础材料：铁锭x2」。这不是玩家操作问题，是列表虚报。
  * <p>
- * 这里用和点击时同一套算法{@link SmartWorkbenchMenu#planRecipe}按真实数量复算一遍：
- * 从库存出发，缺的中间材料沿配方树递归补做，能补出来才判定「做得到」。
- * 判定为做不到的链式项直接从列表里去掉，列表里剩下的每一项都能真的点出来。
+ * 这里用和点击时同一套算法按真实数量复算一遍：从库存出发，缺的中间材料沿配方树
+ * 递归补做，能补出来才判定「做得到」。判定为做不到的链式项直接从列表里去掉，
+ * 列表里剩下的每一项都能真的点出来。
  * <p>
- * 为了不给服务器添负担，这里做了三件事：
+ * 为了不给服务器添负担，这里做了四件事：
  * <ul>
  *   <li>只按「物品种类 → 总数」记账（不区分 NBT、不分槽位），查找是 O(1)，比点击路径的
  *       逐槽规划轻得多；代价是偶尔会多留一项，但绝不会把真能做的东西误删；</li>
+ *   <li>账本直接从 {@link StoragePool#accumulateCounts} 聚合，不再整仓深拷贝一份
+ *       ItemStack（优化方案三：旧版每轮复核前先 {@code snapshotStacks()} 逐个 copy()，
+ *       大仓库一次几千份拷贝全打在扫描的那一秒上）；</li>
  *   <li>深度、展开步数沿用点击路径的配置上限 —— 点击会被这些上限拦住的项，这里也照样拦住，
  *       两边不会打架；</li>
  *   <li>整轮复核有一份总预算，单个候选还有一份小预算。预算用尽时返回
@@ -47,8 +48,7 @@ final class ChainFeasibility {
         UNKNOWN
     }
 
-    private final Map<Item, List<CraftingRecipe>> byResult;
-    private final RegistryAccess registries;
+    private final Map<Item, List<RecipeFacts>> byResult;
     private final int maxDepth;
     private final int maxSteps;
     private final int perCandidateBudget;
@@ -62,35 +62,27 @@ final class ChainFeasibility {
     /** 正在展开的配方 ID，用来断环（A 需要 B、B 又需要 A）。 */
     private final Set<ResourceLocation> active = new HashSet<>();
 
+    /** 本次复核的目标物品种类：补料配方只要用到它就直接跳过（防「拆自己」）。 */
+    private Item blockedTarget;
+
     private int nodes;
     private int totalNodes;
     private int steps;
     private boolean madeIntermediate;
     private boolean exhausted;
 
-    ChainFeasibility(List<ItemStack> initial, Map<Item, List<CraftingRecipe>> byResult,
-                     RegistryAccess registries, int maxDepth, int maxSteps,
-                     int perCandidateBudget, int totalBudget) {
+    ChainFeasibility(StoragePool pool, Map<Item, List<RecipeFacts>> byResult,
+                     int maxDepth, int maxSteps, int perCandidateBudget, int totalBudget) {
         this.byResult = byResult;
-        this.registries = registries;
         this.maxDepth = Math.max(1, maxDepth);
         this.maxSteps = Math.max(1, maxSteps);
         this.perCandidateBudget = Math.max(1, perCandidateBudget);
         this.totalBudget = Math.max(1, totalBudget);
-        for (ItemStack stack : initial) {
-            if (!stack.isEmpty()) {
-                this.counts.merge(stack.getItem(), (long) stack.getCount(), Long::sum);
-            }
-        }
-    }
-
-    /** 整轮复核的预算是否已经用尽；用尽后调用方应当停止复核、保留剩余项。 */
-    boolean isExhausted() {
-        return this.exhausted;
+        pool.accumulateCounts(this.counts);
     }
 
     /** 复核一份配方。同一实例可以连续调用，每次都会把账本还原到库存原值。 */
-    Verdict check(CraftingRecipe recipe) {
+    Verdict check(RecipeFacts recipe) {
         // 预算用尽后也要先做一次「一眼假」判定。玩家报的「石头配方明明只能熔炉烧圆石，
         // 却被列成可链式」就是这一类：熔炉配方压根不在工作台配方索引里，无论给多少预算
         // 都补不出来。这条判定不递归、不花预算，所以预算见底时照样能如实剔除。
@@ -103,6 +95,9 @@ final class ChainFeasibility {
         this.nodes = 0;
         this.steps = 0;
         this.madeIntermediate = false;
+        // 和点击规划同一套「防拆自己」规则：复核哪件物品，就不许任何补料配方吃掉它，
+        // 否则列表会虚报「链式可合成」——点下去却只做出来一堆原地打转。
+        this.blockedTarget = recipe.resultItem;
         this.active.clear();
         boolean ok = planRecipe(recipe, 0);
         // 这两个结论要在回滚之前取出来：rollbackAll 会把中间状态一并还原。
@@ -119,19 +114,15 @@ final class ChainFeasibility {
 
     /**
      * 不递归的「一眼假」判定：只要有一种材料在账本里一个都没有，并且它的任何候选物品
-     * 都<b>没有工作台配方</b>能产出，这份配方就必然做不出来。
-     * <p>
-     * 专治「石头只能靠熔炉烧圆石」这类假链式项：烧炼、锻造、切石都不在
-     * {@link #byResult}（工作台配方索引）里，所以这类材料在这里会被直接判死，
-     * 而不是拖到预算耗尽后被统一保留成 {@link Verdict#UNKNOWN}。
-     * 判据只查一层、不看数量，因此是乐观的：算不出问题就放行，不会误删真能做的东西。
+     * 都<b>没有工作台配方</b>能产出，这份配方就必然做不出来。只查一层、不看数量，
+     * 因此是乐观的：算不出问题就放行，不会误删真能做的东西。
      */
-    private boolean quicklyImpossible(CraftingRecipe recipe) {
-        for (Ingredient ingredient : recipe.getIngredients()) {
-            if (ingredient.isEmpty()) {
+    private boolean quicklyImpossible(RecipeFacts recipe) {
+        for (int i = 0; i < recipe.ingredients.size(); i++) {
+            if (recipe.ingredients.get(i).isEmpty()) {
                 continue;
             }
-            if (hasAvailable(ingredient) || hasAnyCraftingSource(ingredient)) {
+            if (hasAvailable(recipe.candidateItems[i]) || hasAnyCraftingSource(recipe.previews[i])) {
                 continue;
             }
             return true;
@@ -139,25 +130,40 @@ final class ChainFeasibility {
         return false;
     }
 
-    /** 账本里这种材料还剩下至少一个吗（按物品匹配，不看 NBT）。 */
-    private boolean hasAvailable(Ingredient ingredient) {
-        for (ItemStack preview : ingredient.getItems()) {
-            if (!preview.isEmpty() && this.counts.getOrDefault(preview.getItem(), 0L) > 0) {
+    /** 账本里这些种类还剩至少一个吗（按物品匹配，不看 NBT）。 */
+    private boolean hasAvailable(Item[] items) {
+        for (Item item : items) {
+            if (this.counts.getOrDefault(item, 0L) > 0) {
                 return true;
             }
         }
         return false;
     }
 
-    /** 这份材料的某个候选物品，有没有工作台配方能产出它（只查一层索引，不递归展开）。 */
-    private boolean hasAnyCraftingSource(Ingredient ingredient) {
-        for (ItemStack preview : ingredient.getItems()) {
-            if (preview.isEmpty()) {
-                continue;
+    /**
+     * 这份配方的任一直接材料，候选物品里是否包含本次目标物品。
+     * 只看直接材料就够：材料链再深，最深处那条「吃目标」的配方被拦住后，
+     * 上面各层要么换别的来源、要么整链失败，效果等价于整链跳过。
+     */
+    private boolean usesBlockedTarget(RecipeFacts recipe) {
+        if (this.blockedTarget == null) {
+            return false;
+        }
+        for (Item[] candidates : recipe.candidateItems) {
+            for (Item item : candidates) {
+                if (item == this.blockedTarget) {
+                    return true;
+                }
             }
-            for (CraftingRecipe producer : this.byResult.getOrDefault(preview.getItem(), List.of())) {
-                ItemStack result = producer.getResultItem(this.registries);
-                if (!result.isEmpty() && ItemStack.isSameItemSameTags(result, preview)) {
+        }
+        return false;
+    }
+
+    /** 这份材料的某个候选物品，有没有工作台配方能产出它（只查一层索引，不递归展开）。 */
+    private boolean hasAnyCraftingSource(ItemStack[] previews) {
+        for (ItemStack preview : previews) {
+            for (RecipeFacts producer : this.byResult.getOrDefault(preview.getItem(), List.of())) {
+                if (ItemStack.isSameItemSameTags(producer.result, preview)) {
                     return true;
                 }
             }
@@ -167,9 +173,9 @@ final class ChainFeasibility {
 
     /**
      * 规划一份配方：材料先花库存，不够就找能产出它的普通配方补做。
-     * 逻辑与 {@link SmartWorkbenchMenu#planRecipe} 对应，只是账本换成「物品 → 数量」。
+     * 逻辑与 {@code SmartWorkbenchMenu#planRecipe} 对应，只是账本换成「物品 → 数量」。
      */
-    private boolean planRecipe(CraftingRecipe recipe, int depth) {
+    private boolean planRecipe(RecipeFacts recipe, int depth) {
         if (this.exhausted) {
             return false;
         }
@@ -177,31 +183,35 @@ final class ChainFeasibility {
             this.exhausted = true;
             return false;
         }
-        if (depth > this.maxDepth || this.steps >= this.maxSteps || recipe == null) {
+        if (depth > this.maxDepth || this.steps >= this.maxSteps || !recipe.plain) {
             return false;
         }
-        ResourceLocation id = recipe.getId();
+        // 「防拆自己」闸门（同点击规划）：补料配方的直接材料里出现目标物品，直接跳过。
+        // 顶层那条（depth == 0）是玩家点的那一步本身，不受影响。
+        if (depth > 0 && this.blockedTarget != null && usesBlockedTarget(recipe)) {
+            return false;
+        }
+        ResourceLocation id = recipe.id;
         if (id != null && !this.active.add(id)) {
             return false;
         }
         Mark mark = mark();
         boolean complete = true;
-        for (Ingredient ingredient : recipe.getIngredients()) {
-            if (ingredient.isEmpty()) {
+        for (int i = 0; i < recipe.ingredients.size(); i++) {
+            if (recipe.ingredients.get(i).isEmpty()) {
                 continue;
             }
-            if (!planIngredient(ingredient, depth + 1)) {
+            if (!planIngredient(recipe, i, depth + 1)) {
                 complete = false;
                 break;
             }
         }
         if (complete) {
-            ItemStack result = recipe.getResultItem(this.registries);
-            if (!result.isEmpty()) {
-                add(result.getItem(), result.getCount());
-                this.steps++;
-            } else {
+            if (recipe.resultItem == null || recipe.result.isEmpty()) {
                 complete = false;
+            } else {
+                add(recipe.resultItem, recipe.result.getCount());
+                this.steps++;
             }
         }
         if (id != null) {
@@ -214,33 +224,29 @@ final class ChainFeasibility {
     }
 
     /** 先花现成的，花不到就找配方补做一份。 */
-    private boolean planIngredient(Ingredient ingredient, int depth) {
-        if (ingredient.isEmpty()) {
-            return true;
-        }
-        if (consume(ingredient)) {
+    private boolean planIngredient(RecipeFacts recipe, int index, int depth) {
+        ItemStack[] previews = recipe.previews[index];
+        if (consume(previews)) {
             return true;
         }
         Set<Item> tried = new HashSet<>();
-        for (ItemStack preview : ingredient.getItems()) {
+        for (ItemStack preview : previews) {
             if (preview.isEmpty() || !tried.add(preview.getItem())) {
                 continue;
             }
-            Item wanted = preview.getItem();
-            for (CraftingRecipe dependency : this.byResult.getOrDefault(wanted, List.of())) {
+            for (RecipeFacts dependency : this.byResult.getOrDefault(preview.getItem(), List.of())) {
                 if (this.exhausted) {
                     return false;
                 }
-                ResourceLocation id = dependency.getId();
+                ResourceLocation id = dependency.id;
                 if (id == null || this.active.contains(id)) {
                     continue;
                 }
-                ItemStack result = dependency.getResultItem(this.registries);
-                if (result.isEmpty() || !ItemStack.isSameItemSameTags(result, preview)) {
+                if (!ItemStack.isSameItemSameTags(dependency.result, preview)) {
                     continue;
                 }
                 Mark mark = mark();
-                if (planRecipe(dependency, depth) && consume(ingredient)) {
+                if (planRecipe(dependency, depth) && consume(previews)) {
                     this.madeIntermediate = true;
                     return true;
                 }
@@ -251,11 +257,8 @@ final class ChainFeasibility {
     }
 
     /** 从账本里扣掉一件匹配这份材料的物品。 */
-    private boolean consume(Ingredient ingredient) {
-        for (ItemStack preview : ingredient.getItems()) {
-            if (preview.isEmpty()) {
-                continue;
-            }
+    private boolean consume(ItemStack[] previews) {
+        for (ItemStack preview : previews) {
             Item item = preview.getItem();
             if (this.counts.getOrDefault(item, 0L) > 0) {
                 add(item, -1);

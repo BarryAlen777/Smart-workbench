@@ -39,6 +39,15 @@ public class S2CCraftableListPacket {
      */
     public static final int CHUNK_SIZE = 600;
 
+    /**
+     * 解码时最多收多少条：包长字段是服务端写的，异构/恶意服务端可以报个天文数字，
+     * 客户端照着 {@code new ArrayList<>(size)} 预分配就会当场 OOM。这里留出 4 倍余量
+     * （正常包永远不会超），超出的部分照样读掉、只是不装进列表，保证后续字段还对得上。
+     */
+    private static final int MAX_DECODE_ENTRIES = CHUNK_SIZE * 4;
+    /** 存储快照同理：正常一次也就几百格，给个宽裕上限。 */
+    private static final int MAX_DECODE_STORAGE = 8192;
+
     private final BlockPos pos;
     private final List<CraftableEntry> entries;
     /** 这是第几块、一共几块；只有一块时是 0 / 1。 */
@@ -65,27 +74,42 @@ public class S2CCraftableListPacket {
 
     public S2CCraftableListPacket(FriendlyByteBuf buf) {
         this.pos = buf.readBlockPos();
-        int size = buf.readVarInt();
-        List<CraftableEntry> list = new ArrayList<>(size);
+        int size = Math.max(0, buf.readVarInt());
+        int cap = Math.min(size, MAX_DECODE_ENTRIES);
+        List<CraftableEntry> list = new ArrayList<>(Math.min(cap, 1024));
         for (int i = 0; i < size; i++) {
-            list.add(CraftableEntry.read(buf));
+            // 读到包尾就停：大小字段撒谎时不至于空转几十亿次；超上限的条目读掉但不收。
+            if (buf.readableBytes() <= 0) {
+                break;
+            }
+            CraftableEntry entry = CraftableEntry.read(buf);
+            if (i < cap) {
+                list.add(entry);
+            }
         }
         this.entries = List.copyOf(list);
         this.chunkIndex = buf.readVarInt();
         this.chunkCount = Math.max(1, buf.readVarInt());
-        int storageSize = buf.readVarInt();
-        List<ItemStack> storage = new ArrayList<>(storageSize);
+        int storageSize = Math.max(0, buf.readVarInt());
+        int storageCap = Math.min(storageSize, MAX_DECODE_STORAGE);
+        List<ItemStack> storage = new ArrayList<>(Math.min(storageCap, 1024));
         for (int i = 0; i < storageSize; i++) {
+            if (buf.readableBytes() <= 0) {
+                break;
+            }
             ItemStack item = buf.readItem();
             int count = buf.readVarInt();
             if (!item.isEmpty()) {
                 item.setCount(Math.max(1, count));
             }
-            storage.add(item);
+            if (i < storageCap) {
+                storage.add(item);
+            }
         }
         this.storageStacks = List.copyOf(storage);
-        this.storageCount = buf.readVarInt();
-        this.outputCount = buf.readVarInt();
+        // 同快照包：计数钳到非负（审查报告问题 3 的姊妹处）
+        this.storageCount = Math.max(0, buf.readVarInt());
+        this.outputCount = Math.max(0, buf.readVarInt());
         this.storageTruncated = buf.readBoolean();
     }
 

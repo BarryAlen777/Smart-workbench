@@ -1,11 +1,14 @@
 package cn.blockforge.generated.mod2e8abd21.item;
 
+import cn.blockforge.generated.mod2e8abd21.ModNetwork;
 import cn.blockforge.generated.mod2e8abd21.block.SmartWorkbenchBlock;
 import cn.blockforge.generated.mod2e8abd21.blockentity.SmartWorkbenchBlockEntity;
+import cn.blockforge.generated.mod2e8abd21.network.S2CConnectionScanPacket;
 import net.minecraft.ChatFormatting;
 import net.minecraft.core.BlockPos;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.InteractionResultHolder;
@@ -101,6 +104,9 @@ public class WrenchItem extends Item {
                 feedback(player, cleared > 0 ? "cleared" : "no_bindings", cleared > 0
                         ? "已清空这个工作台的 " + cleared + " 个绑定"
                         : "这个工作台还没有绑定任何容器", cleared);
+                if (cleared > 0) {
+                    pushOverviewRefresh(bench, player);
+                }
                 return InteractionResult.CONSUME;
             }
             boolean output = isOutputMode(stack);
@@ -133,6 +139,7 @@ public class WrenchItem extends Item {
                 feedback(player, removedOutput ? "unbound_output" : "unbound_input", removedOutput
                         ? "已取消输出容器绑定：" + target.toShortString()
                         : "已取消取料容器绑定：" + target.toShortString(), target.toShortString());
+                pushOverviewRefresh(bench, player);
                 return InteractionResult.CONSUME;
             }
             if (!bench.canBind(target)) {
@@ -152,6 +159,7 @@ public class WrenchItem extends Item {
                             "已绑定 %s，当前取料容器 %s 个",
                             target.toShortString(), bench.getBindingCount());
                 }
+                pushOverviewRefresh(bench, player);
             } else {
                 feedback(player, output ? "cannot_bind_input" : "cannot_bind_output", output
                         ? "绑不了：重复了、上限到了，或这个容器已经当成取料容器"
@@ -192,6 +200,7 @@ public class WrenchItem extends Item {
                     feedback(player, removedOutput ? "unbound_output" : "unbound_input", removedOutput
                             ? "已取消输出容器绑定：" + pos.toShortString()
                             : "已取消取料容器绑定：" + pos.toShortString(), pos.toShortString());
+                    pushOverviewRefresh(bench, player);
                     return InteractionResult.CONSUME;
                 }
 
@@ -215,6 +224,7 @@ public class WrenchItem extends Item {
                                 "已绑定 %s，当前取料容器 %s 个",
                                 pos.toShortString(), bench.getBindingCount());
                     }
+                    pushOverviewRefresh(bench, player);
                 } else {
                     feedback(player, output ? "cannot_bind_input" : "cannot_bind_output", output
                             ? "绑不了：重复了、上限到了，或这个容器已经当成取料容器"
@@ -237,6 +247,29 @@ public class WrenchItem extends Item {
                     "已选中容器 %s，右键智能工作台完成绑定", pos.toShortString());
         }
         return InteractionResult.CONSUME;
+    }
+
+    /**
+     * r248 问题③：绑定关系一变，立刻给操作者<b>推</b>一份该工作台的新清单
+     * （复用总览回包，流水号用 {@link S2CConnectionScanPacket#REFRESH_SEQ} 标记是主动推送）。
+     * 玩家开着「接入总览」时框线和计数当场跟着变，不用关了再按一遍。
+     * <p>
+     * 服务端<b>不记</b>"谁开着总览"这种状态——每次绑定操作多发一份小包（几十到几百字节，
+     * 频率就是人手点扳手的频率），没开总览的客户端对不上账直接丢弃（见
+     * {@code ConnectionOverview.onRefresh} 的三重对表），比维护一份会泄漏的订阅名单稳当得多。
+     * 只发给动手点的这一个人：别的旁观者想看，按一下总览键要最新的就行。
+     */
+    private static void pushOverviewRefresh(SmartWorkbenchBlockEntity bench, Player player) {
+        if (!(player instanceof ServerPlayer serverPlayer) || serverPlayer.isSpectator()
+                || bench.isRemoved()) {
+            return;
+        }
+        bench.refreshStorages(false);
+        SmartWorkbenchBlockEntity.OverviewReport report = bench.buildOverviewReport();
+        ModNetwork.sendToPlayer(serverPlayer, new S2CConnectionScanPacket(bench.getBlockPos(),
+                S2CConnectionScanPacket.REFRESH_SEQ,
+                report.inputs(), report.totalInputs(), report.deadInputs(),
+                report.outputs(), report.totalOutputs(), report.deadOutputs()));
     }
 
     /** 当前是不是“输出容器”模式。 */

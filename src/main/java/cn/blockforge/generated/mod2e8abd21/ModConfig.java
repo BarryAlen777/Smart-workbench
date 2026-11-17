@@ -5,6 +5,7 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.level.block.Block;
 import net.minecraftforge.common.ForgeConfigSpec;
 import net.minecraftforge.fml.ModLoadingContext;
+import net.minecraftforge.fml.loading.FMLEnvironment;
 
 import java.util.List;
 
@@ -55,6 +56,7 @@ public final class ModConfig {
     public static final ForgeConfigSpec.IntValue MAX_STORAGES;
     public static final ForgeConfigSpec.IntValue MAX_INPUT_BINDINGS;
     public static final ForgeConfigSpec.IntValue MAX_OUTPUT_BINDINGS;
+    public static final ForgeConfigSpec.BooleanValue VANILLA_CRAFT_REFILL;
     public static final ForgeConfigSpec.IntValue AUTO_CRAFT_LIMIT;
     public static final ForgeConfigSpec.BooleanValue BATCH_USE_ALL_MATERIALS;
     public static final ForgeConfigSpec.BooleanValue SHOW_CHAIN_CRAFTABLES;
@@ -65,6 +67,8 @@ public final class ModConfig {
     public static final ForgeConfigSpec.IntValue CHAIN_VERIFY_BUDGET;
     public static final ForgeConfigSpec.IntValue LIST_SLOTS;
     public static final ForgeConfigSpec.ConfigValue<List<? extends String>> STORAGE_BLACKLIST;
+    /** 关掉工作台界面后，材料溯源的金框还在世界里亮几秒（0 = 立刻熄灭）。 */
+    public static final ForgeConfigSpec.IntValue TRACE_HIGHLIGHT_SECONDS;
 
     static {
         ForgeConfigSpec.Builder builder = new ForgeConfigSpec.Builder();
@@ -107,6 +111,12 @@ public final class ModConfig {
         builder.pop();
 
         builder.push("craft");
+        VANILLA_CRAFT_REFILL = builder
+                .comment("原版工作台：按住 Shift 连点产物时，材料用完自动从背包主栏补进合成格。",
+                        "true（默认）：补，手感跟「Shift 连点一键合成」一样；",
+                        "false：关掉，回到原版行为（合成格空了得自己再摆）。",
+                        "只作用于原版合成台；智能工作台有自己的自动补齐，不受这一项影响。")
+                .define("vanillaCraftRefill", true);
         AUTO_CRAFT_LIMIT = builder
                 .comment("点一次「自动合成」最多做多少个，默认 64，最大 12318。")
                 .defineInRange("autoCraftLimit", 64, 1, 12318);
@@ -151,6 +161,14 @@ public final class ModConfig {
                 .defineInRange("chainVerifyBudget", 100_000, 0, 5_000_000);
         builder.pop();
 
+        builder.push("gui");
+        TRACE_HIGHLIGHT_SECONDS = builder
+                .comment("材料溯源的金框在工作台界面关掉之后，还在世界里亮多少秒。",
+                        "默认 5 秒（原来 10 秒偏久，玩家走开了框还挂在天边），填 0 表示关界面立刻熄灭，最大 60 秒。",
+                        "金框只画到渲染距离边缘：太远的地方的框现在也不再画了。")
+                .defineInRange("traceHighlightSeconds", 5, 0, 60);
+        builder.pop();
+
         SPEC = builder.build();
     }
 
@@ -161,6 +179,11 @@ public final class ModConfig {
         // 用全限定名：本类自己也叫 ModConfig，import 会撞名
         ModLoadingContext.get().registerConfig(
                 net.minecraftforge.fml.config.ModConfig.Type.COMMON, SPEC, "smart_workbench-common.toml");
+        // 客户端外观设置（数量数字用字体版还是点阵）单独一份客户端配置；
+        // 专用服务器上没有画面，连这个类都不必碰。
+        if (FMLEnvironment.dist.isClient()) {
+            cn.blockforge.generated.mod2e8abd21.client.DigitStylePref.register();
+        }
     }
 
     /** 自动扫描立方体的边长（5 表示 5x5x5）。 */
@@ -204,6 +227,11 @@ public final class ModConfig {
         return Math.max(1, AUTO_CRAFT_LIMIT.get());
     }
 
+    /** 原版工作台是否在 Shift 连点产物时自动从背包补料（默认开）。 */
+    public static boolean vanillaCraftRefill() {
+        return Boolean.TRUE.equals(VANILLA_CRAFT_REFILL.get());
+    }
+
     /** 批量合成是否忽略数量框、一直做到材料用完（旧行为）。 */
     public static boolean batchUseAllMaterials() {
         return Boolean.TRUE.equals(BATCH_USE_ALL_MATERIALS.get());
@@ -237,6 +265,11 @@ public final class ModConfig {
     /** 整轮列表复核的节点预算；0 表示不复核。 */
     public static int chainVerifyBudget() {
         return Math.max(0, CHAIN_VERIFY_BUDGET.get());
+    }
+
+    /** 关掉工作台界面后，材料溯源的金框还亮多少秒（0 = 立刻熄灭）。 */
+    public static int traceHighlightSeconds() {
+        return Math.max(0, TRACE_HIGHLIGHT_SECONDS.get());
     }
 
     public static int maxListSize() {

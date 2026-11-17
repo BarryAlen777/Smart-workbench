@@ -8,12 +8,11 @@ import net.minecraft.world.item.crafting.Ingredient;
 import net.minecraftforge.items.IItemHandler;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -111,27 +110,49 @@ public final class StoragePool {
     }
 
     /**
-     * 比 {@link #fingerprint()} 更便宜、也更“钝”的指纹：只看物品种类和每格最多 9 个，
-     * 忽略大数量的来回波动（箱子被漏斗抽走几个、农场往里塞几个）。
+     * 比 {@link #fingerprint()} 更“钝”的指纹：只看有哪些种类（按物品+NBT 聚合）、
+     * 每种封顶 9 个，并且<b>与东西摆在哪个箱子哪个格子完全无关</b>。
      * <p>
      * 可合成列表只回答「这份配方能不能做一次」，而一次合成最多用到 9 个同种材料，
-     * 所以把每格数量夹到 9 之后，指纹没变就代表列表结果不会变——大整合包里
-     * 库存数量每秒变一次时，不必把上万份配方重新 plan 一遍。
+     * 所以按种类聚合后夹到 9，指纹没变就代表列表结果不会变——两种抖动都不再重发整表：
+     * 数量大数来回波动（漏斗抽走几块、农场往里塞几个），以及把同一批东西在箱子之间搬来搬去
+     * （审查报告问题 4／优化第 4 条：旧版按槽位顺序异或，A 搬 B 总量没变指纹照变，
+     * 大仓库里整张可合成表被白白重发）。
+     * <p>
+     * 顺序无关的做法：先聚合成「种类 → 封顶总数」，每种的混合值走 splitmix64 终混，
+     * 再<b>相加</b>（加法可交换，与遍历顺序无关）。同一物品拆成两堆还是一堆、
+     * 摆在哪个格子里，指纹都一样。
      */
     public long listFingerprint() {
-        long hash = 0xcbf29ce484222325L;
+        // 聚合只在指纹计算这一小段用；每秒最多一次、每次一遍槽位，开销可以忽略。
+        Map<Item, Map<CompoundTag, Integer>> totals = new HashMap<>();
         for (int i = 0; i < this.size; i++) {
             ItemStack stack = this.stacks[i];
             if (stack.isEmpty()) {
                 continue;
             }
-            long h = Math.min(stack.getCount(), 9);
-            h = h * 31L + stack.getItem().getDescriptionId().hashCode();
-            if (stack.getTag() != null) {
-                h = h * 31L + stack.getTag().hashCode();
+            Map<CompoundTag, Integer> byTag =
+                    totals.computeIfAbsent(stack.getItem(), k -> new HashMap<>());
+            CompoundTag tag = stack.getTag();
+            int capped = Math.min(9, byTag.getOrDefault(tag, 0) + Math.min(stack.getCount(), 9));
+            byTag.put(tag, capped);
+        }
+        long hash = 0x9E3779B97F4A7C15L;
+        for (Map.Entry<Item, Map<CompoundTag, Integer>> byItem : totals.entrySet()) {
+            long itemId = byItem.getKey().getDescriptionId().hashCode();
+            for (Map.Entry<CompoundTag, Integer> byTag : byItem.getValue().entrySet()) {
+                long h = byTag.getValue() + 1L;
+                h = h * 31L + itemId;
+                if (byTag.getKey() != null) {
+                    h = h * 31L + byTag.getKey().hashCode();
+                }
+                // splitmix64 终混：把「某一种数量差 1」这类小差异彻底打散再相加，
+                // 免得相邻种类的小差值在加法里互相抵消。
+                h = (h ^ (h >>> 30)) * 0xbf58476d1ce4e5b9L;
+                h = (h ^ (h >>> 27)) * 0x94d049bb133111ebL;
+                h ^= (h >>> 31);
+                hash += h;
             }
-            hash ^= h;
-            hash *= 0x100000001b3L;
         }
         return hash;
     }
@@ -152,35 +173,14 @@ public final class StoragePool {
         return new HashSet<>(this.byItem.keySet());
     }
 
-    /** 把本地计数恢复到仓库当前数量（每个配方单独试一次时用）。 */
-    public void reset() {
+    /** 按「物品 → 总数量」把整仓聚合进目标账本（链式复核用，省掉逐份 stack 的深拷贝）。 */
+    public void accumulateCounts(Map<Item, Long> target) {
         for (int i = 0; i < this.size; i++) {
-            this.available[i] = this.stacks[i].getCount();
-        }
-    }
-
-    /**
-     * 便宜判断：仓库里到底有没有这种材料。简单材料（不查 NBT）直接按物品查表，
-     * 复杂的老老实实扫一遍。
-     */
-    public boolean mayContain(Ingredient ingredient) {
-        if (ingredient.isEmpty()) {
-            return true;
-        }
-        if (ingredient.isSimple()) {
-            for (ItemStack preview : ingredient.getItems()) {
-                List<Integer> list = this.byItem.get(preview.getItem());
-                if (list != null) {
-                    for (int candidate : list) {
-                        if (this.available[candidate] > 0) {
-                            return true;
-                        }
-                    }
-                }
+            ItemStack stack = this.stacks[i];
+            if (!stack.isEmpty()) {
+                target.merge(stack.getItem(), (long) stack.getCount(), Long::sum);
             }
-            return false;
         }
-        return countMatching(ingredient) > 0;
     }
 
     /** 找一个还剩料、且能匹配这个材料的候选格下标，没有则返回 -1。 */
@@ -212,30 +212,6 @@ public final class StoragePool {
         return -1;
     }
 
-    public int countMatching(Ingredient ingredient) {
-        int count = 0;
-        if (ingredient.isSimple()) {
-            for (ItemStack preview : ingredient.getItems()) {
-                List<Integer> candidates = this.byItem.get(preview.getItem());
-                if (candidates == null) {
-                    continue;
-                }
-                for (int candidate : candidates) {
-                    if (this.available[candidate] > 0 && ingredient.test(this.stacks[candidate])) {
-                        count++;
-                    }
-                }
-            }
-            return count;
-        }
-        for (int i = 0; i < this.size; i++) {
-            if (this.available[i] > 0 && ingredient.test(this.stacks[i])) {
-                count++;
-            }
-        }
-        return count;
-    }
-
     /** 仓库里这种材料一共还有多少个，用来做界面提示。 */
     public int countAvailable(Ingredient ingredient) {
         int total = 0;
@@ -264,36 +240,223 @@ public final class StoragePool {
     /**
      * 模拟消耗一次合成：返回每个材料格选中的候选格子下标（空材料为 -1），缺料时返回 null。
      * 只改动本地计数，不会真的动存储。
+     * <p>
+     * 方案二改造：①找格子走物品索引（原来每个材料都把全部候选格从头扫一遍，
+     * 大仓库 × 上万配方是每秒扫描的大头）；②失败时自动把已扣的计数原路退回——
+     * 旧版失败留下半截扣减、调用方每份配方前都要整表 reset() 补救，
+     * 现在可用计数对外恒定，热路径一次整表拷贝都不用。
      */
     public int[] plan(NonNullList<Ingredient> ingredients) {
-        int[] chosen = new int[ingredients.size()];
-        List<Integer> order = new ArrayList<>();
-        for (int i = 0; i < ingredients.size(); i++) {
-            chosen[i] = -1;
+        int n = ingredients.size();
+        int m = 0;
+        for (int i = 0; i < n; i++) {
             if (!ingredients.get(i).isEmpty()) {
-                order.add(i);
+                m++;
             }
         }
-        if (order.isEmpty()) {
+        if (m == 0) {
             return null;
         }
-        order.sort(Comparator.comparingInt(i -> countMatching(ingredients.get(i))));
-        for (int i : order) {
-            Ingredient ingredient = ingredients.get(i);
-            int best = -1;
-            for (int c = 0; c < this.size; c++) {
-                if (this.available[c] > 0 && ingredient.test(this.stacks[c])) {
-                    best = c;
-                    break;
-                }
+        ensureScratch(m);
+        for (int i = 0, w = 0; i < n; i++) {
+            if (ingredients.get(i).isEmpty()) {
+                continue;
             }
+            this.scratchOrder[w] = i;
+            // 「可选项最少」的先分配，减少通用材料被提前吃光；
+            // 计数只用来排序，超过材料种数就和上限没区别，够数就提前收工。
+            this.scratchKeys[w] = countMatchingCapped(ingredients.get(i), m);
+            w++;
+        }
+        sortScratch(m);
+        int[] chosen = new int[n];
+        Arrays.fill(chosen, -1);
+        for (int oi = 0; oi < m; oi++) {
+            int i = this.scratchOrder[oi];
+            int best = find(ingredients.get(i));
             if (best < 0) {
+                release(chosen);
                 return null;
             }
             this.available[best]--;
             chosen[i] = best;
         }
         return chosen;
+    }
+
+    /** {@link #plan(NonNullList)} 的索引快路径版：直接吃配方索引预计算好的候选种类/简易标记。 */
+    public int[] plan(RecipeFacts facts) {
+        NonNullList<Ingredient> ingredients = facts.ingredients;
+        int n = ingredients.size();
+        int m = 0;
+        for (int i = 0; i < n; i++) {
+            if (!ingredients.get(i).isEmpty()) {
+                m++;
+            }
+        }
+        if (m == 0) {
+            return null;
+        }
+        ensureScratch(m);
+        for (int i = 0, w = 0; i < n; i++) {
+            if (ingredients.get(i).isEmpty()) {
+                continue;
+            }
+            this.scratchOrder[w] = i;
+            this.scratchKeys[w] = optionCount(facts, i, m);
+            w++;
+        }
+        sortScratch(m);
+        int[] chosen = new int[n];
+        Arrays.fill(chosen, -1);
+        for (int oi = 0; oi < m; oi++) {
+            int i = this.scratchOrder[oi];
+            int best = locate(facts, i);
+            if (best < 0) {
+                release(chosen);
+                return null;
+            }
+            this.available[best]--;
+            chosen[i] = best;
+        }
+        return chosen;
+    }
+
+    /**
+     * 纯可行性试算（列表扫描用）：够做一次返回 true，并且<b>不留任何痕迹</b>——
+     * 试完立刻把扣掉的本地计数原路放回，下一份配方直接接着试，
+     * 替代了旧版「每份配方先 reset() 整表 + plan() 泄漏扣减」的组合。
+     */
+    public boolean canCraft(NonNullList<Ingredient> ingredients) {
+        int[] chosen = plan(ingredients);
+        if (chosen == null) {
+            return false;
+        }
+        release(chosen);
+        return true;
+    }
+
+    public boolean canCraft(RecipeFacts facts) {
+        int[] chosen = plan(facts);
+        if (chosen == null) {
+            return false;
+        }
+        release(chosen);
+        return true;
+    }
+
+    /** 把一次 plan 已扣的本地计数原路放回（只放回真正扣过的槽位，开销跟材料数走，不跟库存走）。 */
+    public void release(int[] chosen) {
+        for (int candidate : chosen) {
+            if (candidate >= 0) {
+                this.available[candidate]++;
+            }
+        }
+    }
+
+    /** 索引快路径版找格子：简单材料按候选种类查 byItem；复杂材料才老实全扫。 */
+    private int locate(RecipeFacts facts, int i) {
+        Ingredient ingredient = facts.ingredients.get(i);
+        if (facts.simple[i]) {
+            for (Item item : facts.candidateItems[i]) {
+                List<Integer> candidates = this.byItem.get(item);
+                if (candidates == null) {
+                    continue;
+                }
+                for (int candidate : candidates) {
+                    if (this.available[candidate] <= 0) {
+                        continue;
+                    }
+                    ItemStack stack = this.stacks[candidate];
+                    // 按物品命中：槽位堆没 NBT 时和 Ingredient.test 完全等价（简易材料的
+                    // 候选预览都不带 NBT），省一次 test 的类型比较循环。
+                    if (!stack.hasTag() || ingredient.test(stack)) {
+                        return candidate;
+                    }
+                }
+            }
+            return -1;
+        }
+        for (int c = 0; c < this.size; c++) {
+            if (this.available[c] > 0 && ingredient.test(this.stacks[c])) {
+                return c;
+            }
+        }
+        return -1;
+    }
+
+    /** 这个材料有多少个可选槽位（只用于「谁最紧俏」排序）；够上限就提前返回，不数满。 */
+    private int optionCount(RecipeFacts facts, int i, int cap) {
+        if (facts.simple[i]) {
+            int count = 0;
+            for (Item item : facts.candidateItems[i]) {
+                List<Integer> slots = this.byItem.get(item);
+                if (slots == null) {
+                    continue;
+                }
+                for (int candidate : slots) {
+                    if (this.available[candidate] > 0) {
+                        if (++count >= cap) {
+                            return cap;
+                        }
+                    }
+                }
+            }
+            return count;
+        }
+        return countMatchingCapped(facts.ingredients.get(i), cap);
+    }
+
+    private int countMatchingCapped(Ingredient ingredient, int cap) {
+        int count = 0;
+        if (ingredient.isSimple()) {
+            for (ItemStack preview : ingredient.getItems()) {
+                List<Integer> candidates = this.byItem.get(preview.getItem());
+                if (candidates == null) {
+                    continue;
+                }
+                for (int candidate : candidates) {
+                    if (this.available[candidate] > 0 && ingredient.test(this.stacks[candidate])
+                            && ++count >= cap) {
+                        return cap;
+                    }
+                }
+            }
+            return count;
+        }
+        for (int i = 0; i < this.size; i++) {
+            if (this.available[i] > 0 && ingredient.test(this.stacks[i]) && ++count >= cap) {
+                return cap;
+            }
+        }
+        return count;
+    }
+
+    /** 排序用的两块临时下标/键值缓冲：材料最多 9 个，实例上留一份就够，热循环零分配。 */
+    private int[] scratchOrder = new int[0];
+    private int[] scratchKeys = new int[0];
+
+    private void ensureScratch(int n) {
+        if (this.scratchOrder.length < n) {
+            this.scratchOrder = new int[n];
+            this.scratchKeys = new int[n];
+        }
+    }
+
+    /** 材料数最多 9，插入 sort 比 Comparator + TimSort 装箱便宜得多。 */
+    private void sortScratch(int m) {
+        for (int a = 1; a < m; a++) {
+            int key = this.scratchKeys[a];
+            int idx = this.scratchOrder[a];
+            int b = a - 1;
+            while (b >= 0 && this.scratchKeys[b] > key) {
+                this.scratchKeys[b + 1] = this.scratchKeys[b];
+                this.scratchOrder[b + 1] = this.scratchOrder[b];
+                b--;
+            }
+            this.scratchKeys[b + 1] = key;
+            this.scratchOrder[b + 1] = idx;
+        }
     }
 
     public Source source(int candidate) {
@@ -351,12 +514,25 @@ public final class StoragePool {
      * 必须降级为「不阻断、交给服务端裁决」，否则大仓库会误报缺料。
      */
     public ClientSnapshot mergeForClientSnapshot(int limit) {
+        return mergeForClientSnapshotPrefix(this.handlers.size(), limit);
+    }
+
+    /**
+     * 只把<b>前 {@code handlerLimit} 路处理器</b>的货并进快照（其余照旧能参与别的计算）。
+     * {@code scanHandlers()} 的排布是「接入存储在前、玩家背包和合成格垫后」，
+     * 传 {@code storages.size()} 就正好截出"给 REI 的那份纯存储快照"——
+     * 让调用方拿同一份池子办两件事，不必再为快照把全部箱子<b>扫第二遍</b>（每秒省一遍全仓库遍历）。
+     */
+    public ClientSnapshot mergeForClientSnapshotPrefix(int handlerLimit, int limit) {
         List<ItemStack> merged = new ArrayList<>();
         boolean truncated = false;
         // 按「物品 + NBT」分桶，别拿每种新物品去和已合并的列表逐个比：
         // 大仓库一次快照有几千个槽位，原来的 O(n²) 在每次刷新时都要跑一遍。
         Map<Item, Map<CompoundTag, ItemStack>> buckets = new HashMap<>();
         for (int i = 0; i < this.size; i++) {
+            if (this.handlerIndex[i] >= handlerLimit) {
+                continue;
+            }
             ItemStack stack = this.stacks[i];
             if (stack.isEmpty()) {
                 continue;

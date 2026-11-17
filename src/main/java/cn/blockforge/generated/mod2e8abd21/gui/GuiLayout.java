@@ -10,15 +10,15 @@ public final class GuiLayout {
     private GuiLayout() {}
 
     /** 贴图像素尺寸。blit 必须把这两个数传进去：7 参数的 blit 会按 256x256 解释贴图，
-     *  那样纵向会被拉伸 256/166 倍、右边被裁掉，界面看起来就是「格子全错位」。 */
+     *  那样纵向会被拉伸 256/189 倍、右边被裁掉，界面看起来就是「格子全错位」。 */
     public static final int TEXTURE_WIDTH = 292;
-    public static final int TEXTURE_HEIGHT = 166;
+    public static final int TEXTURE_HEIGHT = 189;
 
     /* 左侧主面板 */
     public static final int MAIN_X = 0;
     public static final int MAIN_Y = 0;
     public static final int MAIN_WIDTH = 176;
-    public static final int MAIN_HEIGHT = 166;
+    public static final int MAIN_HEIGHT = 189;
 
     /* 3x3 合成格（GRID_ITEM_X/Y 就是 Slot 坐标） */
     public static final int GRID_ITEM_X = 28;
@@ -40,14 +40,14 @@ public final class GuiLayout {
 
     /* 玩家背包 3x9 */
     public static final int INV_ITEM_X = 6;
-    public static final int INV_ITEM_Y = 84;
+    public static final int INV_ITEM_Y = 100;
     public static final int INV_PITCH = 18;
     public static final int INV_COLS = 9;
     public static final int INV_ROWS = 3;
 
     /* 快捷栏 */
     public static final int HOTBAR_ITEM_X = 6;
-    public static final int HOTBAR_ITEM_Y = 141;
+    public static final int HOTBAR_ITEM_Y = 159;
     public static final int HOTBAR_PITCH = 18;
     public static final int HOTBAR_COLS = 9;
 
@@ -55,24 +55,36 @@ public final class GuiLayout {
     public static final int LABEL_TITLE_X = 30;
     public static final int LABEL_TITLE_Y = 5;
     public static final int LABEL_INVENTORY_X = 6;
-    public static final int LABEL_INVENTORY_Y = 72;
+    public static final int LABEL_INVENTORY_Y = 88;
 
     /* 右侧面板 */
     public static final int PANEL_X = 178;
     public static final int PANEL_Y = 12;
     public static final int PANEL_WIDTH = 108;
-    public static final int PANEL_HEIGHT = 146;
+    public static final int PANEL_HEIGHT = 174;
 
-    /* 可合成列表 5x5 */
+    /* 可合成列表 5x5（宽松版：从 y=49 起，上面留给上排分类键行） */
     public static final int LIST_ITEM_X = 182;
-    public static final int LIST_ITEM_Y = 32;
+    public static final int LIST_ITEM_Y = 49;
     public static final int LIST_PITCH = 18;
     public static final int LIST_COLS = 5;
     public static final int LIST_ROWS = 5;
 
-    /* 列表标题 */
+    /* 列表标题（搜索框左边的「可合成」，与新的分类键行不冲突，保留） */
     public static final int LIST_TITLE_X = 197;
     public static final int LIST_TITLE_Y = 16;
+
+    /* 上排分类键（frame_x/frame_y 是外框左上角，图标画在 +1） */
+    public static final int TABS_TOP_FRAME_X = 181;
+    public static final int TABS_TOP_FRAME_Y = 28;
+    public static final int TABS_TOP_PITCH = 24;
+    public static final int TABS_TOP_COUNT = 4;
+
+    /* 下排分类键（单独一行，首尾贴边、中间均分，和功能按钮分两行排） */
+    public static final int TABS_BOTTOM_FRAME_X = 181;
+    public static final int TABS_BOTTOM_FRAME_Y = 141;
+    public static final int TABS_BOTTOM_PITCH = 24;
+    public static final int TABS_BOTTOM_COUNT = 4;
 
     /* 搜索框 */
     public static final int SEARCH_X = 213;
@@ -85,22 +97,28 @@ public final class GuiLayout {
     public static final int SCROLL_WIDTH = 4;
 
     /* 刷新按钮 */
-    public static final int BTN_X = 182;
-    public static final int BTN_Y = 126;
-    public static final int BTN_WIDTH = 30;
+    public static final int BTN_X = 181;
+    public static final int BTN_Y = 161;
+    public static final int BTN_WIDTH = 24;
     public static final int BTN_HEIGHT = 13;
 
     /* 自动合成按钮 */
-    public static final int BTN_AUTO_X = 214;
-    public static final int BTN_AUTO_Y = 126;
-    public static final int BTN_AUTO_WIDTH = 30;
+    public static final int BTN_AUTO_X = 207;
+    public static final int BTN_AUTO_Y = 161;
+    public static final int BTN_AUTO_WIDTH = 24;
     public static final int BTN_AUTO_HEIGHT = 13;
 
     /* 同类折叠开关 */
-    public static final int BTN_FOLD_X = 246;
-    public static final int BTN_FOLD_Y = 126;
-    public static final int BTN_FOLD_WIDTH = 30;
+    public static final int BTN_FOLD_X = 233;
+    public static final int BTN_FOLD_Y = 161;
+    public static final int BTN_FOLD_WIDTH = 24;
     public static final int BTN_FOLD_HEIGHT = 13;
+
+    /* 排序切换按钮 */
+    public static final int BTN_SORT_X = 259;
+    public static final int BTN_SORT_Y = 161;
+    public static final int BTN_SORT_WIDTH = 24;
+    public static final int BTN_SORT_HEIGHT = 13;
 
     /* 自动补齐开关 */
     public static final int BTN_REFILL_X = 92;
@@ -116,7 +134,9 @@ public final class GuiLayout {
 
     /* 接入存储计数 */
     public static final int STORAGE_X = 182;
-    public static final int STORAGE_Y = 143;
+    public static final int STORAGE_Y = 176;
+    public static final int STORAGE_WIDTH = 100;
+    public static final int STORAGE_HEIGHT = 9;
 
     /* 批量合成数量输入框 */
     public static final int BATCH_INPUT_X = 122;

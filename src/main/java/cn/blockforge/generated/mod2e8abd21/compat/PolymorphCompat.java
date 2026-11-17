@@ -139,9 +139,11 @@ public final class PolymorphCompat {
         try {
             // 多态合成靠这个把「配方列表」推给正在看这个界面的客户端，别省
             setContainerMenuMethod.invoke(data, menu);
-            // 第 4 个参数是「候选配方列表」的快捷方式：传空 List 等于告诉它「一份候选都没有」，
-            // 必须传 null 让它自己按 RecipeType + 合成格去查。
-            Object maybeRecipe = getRecipeMethod.invoke(data, type, inventory, level, null);
+            // 第 4 个参数是「调用方已经筛好的候选配方列表」；传 null 会让它直接
+            // recipesList.isEmpty() 空指针（Polymorph 的 AbstractRecipeData#getRecipe），
+            // 被下面的 catch 吞掉 → 每次都返回 empty，玩家怎么点都切不了配方。
+            // 传空 List 才是「我一份都没筛，你自己按 RecipeType + 合成格去查」。
+            Object maybeRecipe = getRecipeMethod.invoke(data, type, inventory, level, List.of());
             if (maybeRecipe instanceof Optional<?> optional && optional.isPresent()
                     && optional.get() instanceof CraftingRecipe crafting) {
                 // 这里只负责把多态合成选的配方递回去；是否真的匹配当前合成格由调用方
